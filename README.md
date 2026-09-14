@@ -227,5 +227,5 @@ SIH Logger/
 
 This prototype runs **completely offline without internet access**:
 - **Embeddings & RAG**: Uses a standalone pure-Python TF-IDF sparse vector retrieval engine requiring no external downloads.
-- **Inference**: Defaults to `DEMO INFERENCE FALLBACK` when Ollama is offline; automatically binds to local Ollama (`phi3:mini`) if present on `localhost:11434`.
+- **Inference**: Defaults to `DEMO INFERENCE FALLBACK` when Ollama is offline; automatically binds to local Ollama (`qwen2.5:3b `) if present on `localhost:11434`.
 - **Zero Cloud Leakage**: No external cloud APIs (OpenAI, Gemini, Anthropic) are ever called.
