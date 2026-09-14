@@ -1,0 +1,38 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: ulfp-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - ULFP_HOST=0.0.0.0
+      - ULFP_PORT=8000
+      - ULFP_INFERENCE_MODE=auto
+      - ULFP_OLLAMA_BASE_URL=http://host.docker.internal:11434
+    volumes:
+      - ulfp-evidence:/app/data/evidence
+      - ulfp-data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    container_name: ulfp-frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  ulfp-evidence:
+  ulfp-data:
