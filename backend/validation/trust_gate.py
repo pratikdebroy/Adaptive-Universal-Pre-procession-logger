@@ -174,7 +174,9 @@ class HybridTrustGate:
 
     MAC_REGEX = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$")
 
-    def validate(self, parsed_fields: dict[str, Any], confidence: float) -> TrustGateResult:
+    def validate(
+        self, parsed_fields: dict[str, Any], confidence: float, source_hint: str = "generic"
+    ) -> TrustGateResult:
         checks: list[ValidationCheck] = []
         failures: list[str] = []
         primary_reason = QuarantineReason.TRUST_GATE_FAILED
@@ -182,14 +184,26 @@ class HybridTrustGate:
         failed_check_name = ""
         failed_value = None
 
-        # Check 1: Required fields
-        required = {"source.ip", "destination.ip", "action"}
+        # Check 1: Required fields (source-aware)
+        source_lower = (source_hint or "generic").lower()
+        if any(k in source_lower for k in ["router", "cisco", "switch", "link"]):
+            required = {"network.interface", "action"}
+        elif any(k in source_lower for k in ["ids", "snort", "suricata", "scan"]):
+            required = {"source.ip", "destination.ip", "network.transport"}
+        elif any(k in source_lower for k in ["firewall", "netfilter", "iptables", "network"]):
+            required = {"source.ip", "destination.ip", "action"}
+        else:
+            if "network.interface" in parsed_fields and "source.ip" not in parsed_fields:
+                required = {"network.interface", "action"}
+            else:
+                required = {"source.ip", "destination.ip", "action"}
+
         present = set(parsed_fields.keys())
         missing = required - present
         checks.append(ValidationCheck(
             check_name="required_fields",
             passed=len(missing) == 0,
-            detail=f"Missing: {', '.join(missing)}" if missing else "All required fields present",
+            detail=f"Missing: {', '.join(missing)}" if missing else f"All required fields present ({', '.join(required)})",
             value=list(missing) if missing else [],
         ))
         if missing:

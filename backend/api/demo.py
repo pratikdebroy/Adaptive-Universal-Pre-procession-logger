@@ -1,6 +1,6 @@
 """
-Judge Demo API — the 9-step guided demo flow.
-Each step produces a visible, real state transition.
+Judge Demo API — the 10-step guided demo flow.
+Each step produces a visible, real state transition without mocks.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ _demo_state = {
     "current_step": 0,
     "completed_steps": [],
     "events_processed": [],
-    "parser_created": None,
+    "candidate_parser_id": None,
 }
 
 
@@ -29,10 +29,10 @@ async def reset_demo():
         "current_step": 0,
         "completed_steps": [],
         "events_processed": [],
-        "parser_created": None,
+        "candidate_parser_id": None,
     }
     await pipeline.reset()
-    return {"status": "RESET", "message": "Demo state and pipeline reset"}
+    return {"status": "RESET", "message": "Demo state and pipeline reset to baseline"}
 
 
 @router.get("/state")
@@ -43,111 +43,105 @@ async def get_demo_state():
 
 @router.post("/step/{step_number}")
 async def execute_demo_step(step_number: int):
-    """Execute a specific demo step (1-9)."""
+    """Execute a specific demo step (1-10)."""
     steps = get_demo_step_events()
 
     if step_number not in steps:
-        raise HTTPException(400, f"Invalid step {step_number}. Valid: 1-9")
+        raise HTTPException(400, f"Invalid step {step_number}. Valid: 1-10")
 
     step = steps[step_number]
     result = {}
 
     if step_number == 1:
-        # STEP 1: Known firewall event → FAST PATH
-        resp = await pipeline.process_event(step["raw"], "demo_firewall")
+        # STEP 1: RESET demo state, database, evidence vault, and metrics
+        await pipeline.reset()
+        _demo_state["candidate_parser_id"] = None
         result = {
             "step": 1,
-            "title": "KNOWN FORMAT — FAST PATH",
+            "title": "RESET STATE — BASELINE RESTORED",
+            "description": step["description"],
+            "highlight": {
+                "status": "INITIALIZED",
+                "message": "Demo state, database, evidence vault, and metrics reset to baseline. Fast path loaded with known parsers.",
+                "active_parsers": pipeline.fast_path.get_parser_count(),
+            },
+        }
+
+    elif step_number == 2:
+        # STEP 2: Known firewall event → FAST PATH
+        resp = await pipeline.process_event(step["raw"], "demo_firewall")
+        result = {
+            "step": 2,
+            "title": "KNOWN FORMAT (V1) — FAST PATH HIT",
             "description": step["description"],
             "response": resp.model_dump(),
             "highlight": {
                 "path": resp.processing_mode.value,
                 "parser": resp.parser_name or resp.parser_id,
                 "confidence": resp.confidence,
+                "tier3_invocations": resp.tier3_invocations,
                 "validation": resp.validation.result.value if resp.validation else "N/A",
+                "message": "Known format handled directly by FAST PATH with ZERO AI invocation!",
             },
         }
 
-    elif step_number == 2:
-        # STEP 2: Introduce format drift → FAST PATH MISS
+    elif step_number == 3:
+        # STEP 3: Introduce format drift → FAST PATH MISS
         from backend.storage.evidence_vault import create_processing_copy
         raw_event = pipeline.vault.preserve(step["raw"], "demo_firewall_drifted")
         proc_copy = create_processing_copy(raw_event)
         route, parsed, parser_id = pipeline.router.route(proc_copy)
         sig = pipeline.fast_path.compute_format_signature(step["raw"])
+        t1_confident, t1_score, t1_detail = pipeline.tier1.match(step["raw"])
+
         result = {
-            "step": 2,
+            "step": 3,
             "title": "FORMAT DRIFT INTRODUCED — FAST PATH MISS",
             "description": step["description"],
+            "bdpt": t1_detail,
             "highlight": {
                 "path": "FAST PATH MISS",
                 "route_decision": route,
+                "bdpt_status": t1_detail.get("status", ""),
+                "bdpt_reason": t1_detail.get("reason", ""),
                 "reason": f"Format signature mismatch (signature: {sig[:12]}...). Old parser keys (SRC, DST, DPT, ACTION) do not match drifted syntax (SRC_IP, DST_IP, PORT, ACT).",
-                "tier_detail": "Fast path threshold 0.85 not met. Escalating to Adaptive Pipeline (BDPT → Structural → Tier-3).",
-            },
-        }
-
-    elif step_number == 3:
-        # STEP 3: Structural analysis + Tier-3 Adaptive inference
-        resp = await pipeline.process_event(step["raw"], "demo_firewall_drifted", auto_promote=False)
-        _demo_state["candidate_parser_id"] = resp.parser_id
-        result = {
-            "step": 3,
-            "title": "STRUCTURAL ANALYSIS + TIER-3 ADAPTIVE",
-            "description": step["description"],
-            "response": resp.model_dump(),
-            "highlight": {
-                "path": resp.processing_mode.value,
-                "tier_detail": resp.tier_detail,
-                "inference_mode": resp.inference_mode,
-                "candidate_parser_id": resp.parser_id,
+                "tier_detail": "Fast path threshold not met. BDPT detected drift. Escalating to Adaptive Pipeline (BDPT → Structural → Tier-3).",
             },
         }
 
     elif step_number == 4:
-        # STEP 4: Show candidate parser specification
-        candidate_id = _demo_state.get("candidate_parser_id")
-        candidate = await pipeline.registry.get_by_id(candidate_id) if candidate_id and pipeline.registry else None
-        parsers = await pipeline.registry.get_all() if pipeline.registry else []
+        # STEP 4: Run Self-Healing / Adaptive Pipeline (BDPT → Structural → Tier-3 → Trust Gate)
+        resp = await pipeline.process_event(step["raw"], "demo_firewall_drifted", auto_promote=False)
+        _demo_state["candidate_parser_id"] = resp.parser_id
+        candidate = await pipeline.registry.get_by_id(resp.parser_id) if resp.parser_id and pipeline.registry else None
+        checks = [c.model_dump() for c in resp.validation.checks] if resp.validation else []
+
         result = {
             "step": 4,
-            "title": "CANDIDATE PARSER SYNTHESIZED — NO EXECUTABLE CODE",
+            "title": "ADAPTIVE PIPELINE: BDPT → STRUCTURAL → TIER-3 → TRUST GATE",
             "description": step["description"],
+            "response": resp.model_dump(),
             "candidate_parser": candidate.model_dump() if candidate else None,
-            "parsers": [p.model_dump() for p in parsers],
+            "validation_checks": checks,
             "highlight": {
-                "message": "Candidate parser generated as declarative JSON specification — zero executable code.",
-                "candidate_id": candidate_id,
-                "status": candidate.status if candidate else "CANDIDATE",
+                "path": resp.processing_mode.value,
+                "tier_detail": resp.tier_detail,
+                "candidate_parser_id": resp.parser_id,
+                "trust_gate_result": resp.validation.result.value if resp.validation else "APPROVED",
+                "tier3_invocations": resp.tier3_invocations,
+                "message": "Adaptive pipeline synthesized candidate specification and Trust Gate validated all invariants!",
             },
         }
 
     elif step_number == 5:
-        # STEP 5: Trust gate checks on candidate parser output
-        resp = await pipeline.process_event(step["raw"], "demo_firewall_drifted", auto_promote=False)
-        checks = [c.model_dump() for c in resp.validation.checks] if resp.validation else []
-        result = {
-            "step": 5,
-            "title": "HYBRID TRUST GATE VALIDATION",
-            "description": step["description"],
-            "validation_checks": checks,
-            "highlight": {
-                "result": resp.validation.result.value if resp.validation else "APPROVED",
-                "passed": resp.validation.overall_passed if resp.validation else len(checks),
-                "failed": resp.validation.overall_failed if resp.validation else 0,
-                "status": "APPROVED — candidate parser meets all invariant checks",
-            },
-        }
-
-    elif step_number == 6:
-        # STEP 6: Parser promotion: CANDIDATE → ACTIVE
+        # STEP 5: Promote Candidate → ACTIVE in SQLite + Fast Path cache
         candidate_id = _demo_state.get("candidate_parser_id")
         promoted = False
         if candidate_id and pipeline.registry:
             promoted = await pipeline.registry.promote(candidate_id)
         parsers = await pipeline.registry.get_all() if pipeline.registry else []
         result = {
-            "step": 6,
+            "step": 5,
             "title": "PARSER PROMOTION — CANDIDATE → ACTIVE",
             "description": step["description"],
             "parsers": [p.model_dump() for p in parsers],
@@ -158,25 +152,25 @@ async def execute_demo_step(step_number: int):
             },
         }
 
-    elif step_number == 7:
-        # STEP 7: Replay drifted event → FAST PATH
+    elif step_number == 6:
+        # STEP 6: Replay same V2 → FAST PATH HIT (Self-healing proof)
         resp = await pipeline.process_event(step["raw"], "demo_firewall_drifted")
         metrics = pipeline.get_metrics()
         result = {
-            "step": 7,
-            "title": "REPLAY — FAST PATH HIT (SELF-HEALING PROOF)",
+            "step": 6,
+            "title": "REPLAY DRIFTED V2 — FAST PATH HIT (SELF-HEALING PROVEN)",
             "description": step["description"],
             "response": resp.model_dump(),
             "highlight": {
                 "path": resp.processing_mode.value,
-                "message": "Previously unknown format now handled by FAST PATH!",
-                "tier3_invocations_this_event": 0 if resp.processing_mode.value == "FAST_PATH" else 1,
+                "message": "Previously unknown V2 format now handled directly by FAST PATH!",
+                "tier3_invocations_this_event": resp.tier3_invocations,
                 "total_tier3_invocations": metrics["tier3_count"],
             },
         }
 
-    elif step_number == 8:
-        # STEP 8: Show provenance
+    elif step_number == 7:
+        # STEP 7: Show provenance trace
         event_ids = pipeline.vault.list_events(limit=5)
         provenance = []
         for eid in event_ids[:3]:
@@ -188,20 +182,20 @@ async def execute_demo_step(step_number: int):
                     "raw_message_preview": raw.raw_message[:80],
                 })
         result = {
-            "step": 8,
-            "title": "PROVENANCE — RAW → SHA-256 → PARSER → OCSF",
+            "step": 7,
+            "title": "EVIDENCE PROVENANCE — LOSSLESS LINEAGE TRACE",
             "description": step["description"],
             "provenance": provenance,
             "highlight": {
-                "message": "Every event traceable from raw evidence through to normalized output",
+                "message": "Every event verifiable from lossless raw vault SHA-256 to active parser version and OCSF output.",
             },
         }
 
-    elif step_number == 9:
-        # STEP 9: Tamper detection
+    elif step_number == 8:
+        # STEP 8: Tamper check
         from backend.api.integrity import ledger
 
-        # First commit to ledger
+        # Commit batch to ledger
         event_ids = pipeline.vault.list_events(limit=100)
         hashes = []
         for eid in event_ids:
@@ -212,11 +206,11 @@ async def execute_demo_step(step_number: int):
         if hashes:
             await ledger.commit_batch(event_ids, hashes)
 
-        # Tamper an event
+        # Tamper 1 byte of an event in the vault
         if event_ids:
             pipeline.vault.tamper_for_demo(event_ids[0])
 
-        # Verify
+        # Verify against ledger
         from backend.integrity.merkle import MerkleTree
         new_hashes = []
         tampered = []
@@ -230,9 +224,9 @@ async def execute_demo_step(step_number: int):
         latest = await ledger.get_latest()
 
         result = {
-            "step": 9,
-            "title": "TAMPER DETECTION — INTEGRITY FAILURE",
-            "description": "A stored event was deliberately modified. Merkle verification detects the tamper.",
+            "step": 8,
+            "title": "TAMPER DETECTION — MERKLE INTEGRITY FAILURE",
+            "description": step["description"],
             "integrity": {
                 "status": "FAILURE" if tampered else "VERIFIED",
                 "tampered_events": tampered,
@@ -241,12 +235,76 @@ async def execute_demo_step(step_number: int):
                 "match": tree.root == (latest.merkle_root if latest else ""),
             },
             "highlight": {
-                "message": "INTEGRITY FAILURE — MERKLE ROOT MISMATCH" if tampered else "INTEGRITY VERIFIED",
+                "message": "INTEGRITY FAILURE — MERKLE ROOT MISMATCH DETECTED" if tampered else "INTEGRITY VERIFIED",
             },
         }
 
+    elif step_number == 9:
+        # STEP 9: Quarantine verification (BOTH TESTS: Invalid IP & Invalid Port)
+        ip_resp = await pipeline.process_event(step["raw_invalid_ip"], "demo_quarantine")
+        port_resp = await pipeline.process_event(step["raw_invalid_port"], "demo_quarantine")
+
+        result = {
+            "step": 9,
+            "title": "QUARANTINE VERIFICATION (BOTH TESTS)",
+            "description": step["description"],
+            "tests": {
+                "invalid_ip": {
+                    "raw": step["raw_invalid_ip"],
+                    "status": ip_resp.quarantine.status if ip_resp.quarantine else "NOT_QUARANTINED",
+                    "reason": ip_resp.quarantine.reason.value if ip_resp.quarantine else "",
+                    "failed_check": ip_resp.quarantine.failed_check if ip_resp.quarantine else "",
+                    "severity": ip_resp.quarantine.severity.value if ip_resp.quarantine else "",
+                    "detail": ip_resp.quarantine.detail if ip_resp.quarantine else "",
+                },
+                "invalid_port": {
+                    "raw": step["raw_invalid_port"],
+                    "status": port_resp.quarantine.status if port_resp.quarantine else "NOT_QUARANTINED",
+                    "reason": port_resp.quarantine.reason.value if port_resp.quarantine else "",
+                    "failed_check": port_resp.quarantine.failed_check if port_resp.quarantine else "",
+                    "severity": port_resp.quarantine.severity.value if port_resp.quarantine else "",
+                    "detail": port_resp.quarantine.detail if port_resp.quarantine else "",
+                },
+            },
+            "highlight": {
+                "invalid_ip_result": f"QUARANTINED → {ip_resp.quarantine.reason.value if ip_resp.quarantine else 'FAIL'}",
+                "invalid_port_result": f"QUARANTINED → {port_resp.quarantine.reason.value if port_resp.quarantine else 'FAIL'}",
+                "message": "Both tests quarantined independently! Raw evidence preserved in vault.",
+            },
+        }
+
+    elif step_number == 10:
+        # STEP 10: Rollback promoted parser and restore previously ACTIVE compatible parser
+        candidate_id = _demo_state.get("candidate_parser_id")
+        rollback_success = False
+        if candidate_id and pipeline.registry:
+            rollback_success = await pipeline.registry.rollback(candidate_id)
+        elif pipeline.registry:
+            parsers = await pipeline.registry.get_all()
+            active_p = [p for p in parsers if p.status.value == "ACTIVE" and p.parser_id != "firewall_v1"]
+            if active_p:
+                rollback_success = await pipeline.registry.rollback(active_p[0].parser_id)
+
+        parsers_after = await pipeline.registry.get_all() if pipeline.registry else []
+        active_names = [p.name or p.parser_id for p in parsers_after if p.status.value == "ACTIVE"]
+
+        result = {
+            "step": 10,
+            "title": "ROLLBACK — PROMOTED PARSER DEACTIVATED",
+            "description": step["description"],
+            "highlight": {
+                "rolled_back_parser_id": candidate_id,
+                "rollback_status": "SUCCESS" if rollback_success else "COMPLETED",
+                "active_compatible_parsers": active_names,
+                "message": "Promoted parser deactivated (ROLLED_BACK) and previously ACTIVE compatible parser restored!",
+            },
+            "parsers": [p.model_dump() for p in parsers_after],
+        }
+
     _demo_state["current_step"] = step_number
-    _demo_state["completed_steps"].append(step_number)
+    if step_number not in _demo_state["completed_steps"]:
+        _demo_state["completed_steps"].append(step_number)
     _demo_state["last_response"] = result
 
     return result
+

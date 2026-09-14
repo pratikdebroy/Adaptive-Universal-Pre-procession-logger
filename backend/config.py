@@ -52,8 +52,8 @@ class Settings(BaseSettings):
 
     # --- Ollama / Inference ---
     ollama_base_url: str = "http://localhost:11434"
-    ollama_model: str = "qwen2.5:7b-instruct"
-    ollama_timeout_seconds: int = 120
+    ollama_model: str = "qwen2.5:3b"
+    ollama_timeout_seconds: int = 60
     inference_mode: str = "auto"  # "auto", "ollama", "demo_fallback"
 
     # --- RAG ---

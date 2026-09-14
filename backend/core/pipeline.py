@@ -96,10 +96,11 @@ class PipelineOrchestrator:
                         format_signature=self.fast_path.compute_format_signature(spec.template),
                         spec=spec,
                         confidence=1.0,
+                        parser_id=parser_id,
                     )
                     await self.registry.promote(record.parser_id)
-            except Exception:
-                pass  # Already exists
+            except Exception as e:
+                logger.warning(f"Error seeding parser {parser_id}: {e}")
 
         # Seed RAG
         self.rag.seed_known_templates()
@@ -189,6 +190,7 @@ class PipelineOrchestrator:
         tier_detail = ""
         processing_mode = ProcessingMode.FAST_PATH
         confidence = 0.0
+        tier3_invocations_this_event = 0
 
         if route == "FAST_PATH" and parsed:
             # ── FAST PATH ──
@@ -258,6 +260,7 @@ class PipelineOrchestrator:
                         message, t2_detail
                     )
                     processing_mode = ProcessingMode.TIER3_ADAPTIVE
+                    tier3_invocations_this_event = 1
                     self.metrics["tier3_count"] += 1
                     tier_detail += f" → Tier-3: {t3_detail.get('inference_mode', '')}"
 
@@ -334,7 +337,7 @@ class PipelineOrchestrator:
         # ── Stage 4: VALIDATE (Event Trust Gate) ──
         if parsed and parsed.fields:
             stage_start = time.perf_counter()
-            validation = self.trust_gate.validate(parsed.fields, confidence)
+            validation = self.trust_gate.validate(parsed.fields, confidence, source_hint=source)
             stages.append(PipelineStageInfo(
                 name="VALIDATE",
                 status=validation.result.value,
@@ -415,6 +418,7 @@ class PipelineOrchestrator:
                 tier_detail=tier_detail,
                 stages=stages,
                 inference_mode=get_current_inference_mode(),
+                tier3_invocations=tier3_invocations_this_event,
             )
 
         # Should not reach here normally
@@ -533,6 +537,7 @@ class PipelineOrchestrator:
             stages=stages,
             inference_mode=get_current_inference_mode(),
             validation=validation,
+            tier3_invocations=0,
         )
 
     async def _save_processed(

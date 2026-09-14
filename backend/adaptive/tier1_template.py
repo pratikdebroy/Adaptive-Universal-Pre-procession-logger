@@ -242,8 +242,12 @@ class DrainMiner:
 
 class Tier1Matcher:
     """
-    Tier 1: Template-based matching using Drain miner.
-    Pre-loads known log templates for fast matching.
+    Tier 1: Custom Bidirectional Template Matching (BDPT).
+    Combines Drain-style tree mining with custom bidirectional scanning:
+      - Front-side scanning (prefix constants / headers)
+      - Back-side scanning (suffix constants / status / actions)
+      - Variable position alignment (<*> slots)
+      - Structural similarity diagnostics (matched, similarities, reasons)
     """
 
     def __init__(self):
@@ -266,27 +270,134 @@ class Tier1Matcher:
         for log in known_logs:
             self.miner.add_log_message(log)
 
+    @staticmethod
+    def _token_matches(msg_tok: str, tmpl_tok: str) -> bool:
+        """Evaluate structural token equality or key=<*> slot alignment."""
+        if tmpl_tok == "<*>":
+            return True
+        if tmpl_tok == msg_tok:
+            return True
+        if "=" in tmpl_tok and "=" in msg_tok:
+            tmpl_key = tmpl_tok.split("=", 1)[0]
+            msg_key = msg_tok.split("=", 1)[0]
+            if tmpl_key == msg_key:
+                tmpl_val = tmpl_tok.split("=", 1)[1]
+                if tmpl_val == "<*>":
+                    return True
+                msg_val = msg_tok.split("=", 1)[1]
+                return tmpl_val == msg_val
+        return False
+
+    def _bidirectional_scan(
+        self, tokens: list[str], tmpl_tokens: list[str]
+    ) -> tuple[float, float, float, list[str]]:
+        """
+        Execute front-side and back-side structural scans between tokens and a template.
+        Returns: (front_sim, back_sim, overall_sim, drift_tokens)
+        """
+        total = max(len(tokens), len(tmpl_tokens))
+        if total == 0:
+            return 0.0, 0.0, 0.0, []
+
+        min_len = min(len(tokens), len(tmpl_tokens))
+
+        # 1. Front-side scan (prefix tokens)
+        front_matches = 0
+        drift_tokens = []
+        for i in range(min_len):
+            if self._token_matches(tokens[i], tmpl_tokens[i]):
+                front_matches += 1
+            else:
+                drift_tokens.append(f"{tokens[i]} ≠ {tmpl_tokens[i]}")
+
+        # 2. Back-side scan (suffix tokens)
+        back_matches = 0
+        for j in range(min_len):
+            if self._token_matches(tokens[-(j + 1)], tmpl_tokens[-(j + 1)]):
+                back_matches += 1
+
+        front_sim = front_matches / total
+        back_sim = back_matches / total
+        overall_sim = (front_sim + back_sim) / 2.0
+
+        return front_sim, back_sim, overall_sim, drift_tokens
+
     def match(self, message: str) -> tuple[bool, float, dict[str, Any]]:
         """
-        Try to match a message against known templates.
-        Returns: (confident, score, detail)
+        Evaluate log message against known templates using Custom BDPT.
+        Returns: (confident, similarity_score, diagnostic_detail)
         """
-        result = self.miner.detect_drift(message)
-        status = result.get("status", "")
-
-        if status == "MATCHED":
-            sim = result.get("similarity", 0.0)
-            confident = sim >= settings.structural_confidence_threshold
-            return confident, sim, {
-                "tier": "TIER-1 TEMPLATE MATCHING",
-                "status": status,
-                "template": result.get("template", ""),
-                "variables": result.get("variables", []),
-                "similarity": sim,
-            }
-        else:
+        tokens = DrainMiner.preprocess(message)
+        if not tokens:
             return False, 0.0, {
-                "tier": "TIER-1 TEMPLATE MATCHING",
-                "status": status,
-                "reason": result.get("reason", ""),
+                "tier": "TIER-1 TEMPLATE MATCHING (BDPT)",
+                "status": "EMPTY",
+                "matched": False,
+                "similarity": 0.0,
+                "front_similarity": 0.0,
+                "back_similarity": 0.0,
+                "reason": "Empty message tokens",
             }
+
+        # Find best matching candidate cluster via Drain tree
+        drain_result = self.miner.detect_drift(message)
+        best_cluster, _ = self.miner.match(message)
+
+        # Fallback to all clusters if Drain tree didn't find path
+        clusters = [best_cluster] if best_cluster else self.miner.clusters
+
+        best_sim = -1.0
+        best_front = 0.0
+        best_back = 0.0
+        best_tmpl = ""
+        best_drifts: list[str] = []
+        best_cluster_obj: LogCluster | None = None
+
+        for cluster in clusters:
+            if cluster is None:
+                continue
+            f_sim, b_sim, o_sim, drifts = self._bidirectional_scan(tokens, cluster.template)
+            if o_sim > best_sim:
+                best_sim = o_sim
+                best_front = f_sim
+                best_back = b_sim
+                best_tmpl = cluster.get_template_str()
+                best_drifts = drifts
+                best_cluster_obj = cluster
+
+        if best_sim < 0.0:
+            best_sim = 0.0
+
+        threshold = settings.structural_confidence_threshold
+        confident = best_sim >= threshold and best_cluster_obj is not None
+
+        variables = []
+        if best_cluster_obj:
+            variables = self.miner.extract_variables(message, best_cluster_obj)
+
+        if confident:
+            reason = (
+                f"BDPT Match: Front ({best_front:.2f}) and back ({best_back:.2f}) tokens "
+                f"align with template '{best_tmpl}' (similarity: {best_sim:.2f} >= {threshold})"
+            )
+            status = "MATCHED"
+        else:
+            drift_summary = f" Drift: [{', '.join(best_drifts[:3])}]" if best_drifts else ""
+            reason = (
+                f"BDPT Miss: Structural tokens drifted{drift_summary} "
+                f"(front: {best_front:.2f}, back: {best_back:.2f}, similarity: {best_sim:.2f} < {threshold})"
+            )
+            status = drain_result.get("status", "DRIFT_DETECTED")
+
+        return confident, best_sim, {
+            "tier": "TIER-1 TEMPLATE MATCHING (BDPT)",
+            "status": status,
+            "matched": confident,
+            "candidate_template": best_tmpl,
+            "similarity": round(best_sim, 4),
+            "front_similarity": round(best_front, 4),
+            "back_similarity": round(best_back, 4),
+            "reason": reason,
+            "variables": variables,
+        }
+

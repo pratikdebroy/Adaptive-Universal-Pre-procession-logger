@@ -96,7 +96,9 @@ def _detect_format_hint(message: str) -> str:
     msg = message.strip()
     if not msg:
         return "empty"
-    if msg.startswith("{") or msg.startswith("["):
+    if msg.startswith("[**"):
+        return "text"
+    if msg.startswith("{") or (msg.startswith("[") and (msg.endswith("]") or re.match(r"^\[\s*[\{\"]", msg))):
         return "json"
     if msg.startswith("<?xml") or (msg.startswith("<") and ">" in msg and not msg.startswith("<PRI>")):
         # Distinguish syslog <PRI> from XML tags

@@ -399,6 +399,7 @@ class ProcessedEventResponse(BaseModel):
     tier_detail: str = ""
     stages: list[PipelineStageInfo] = Field(default_factory=list)
     inference_mode: str = ""
+    tier3_invocations: int = 0
 
 
 class HealthResponse(BaseModel):

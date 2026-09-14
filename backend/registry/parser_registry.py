@@ -65,11 +65,12 @@ class ParserRegistry:
         spec: ParserSpecification,
         confidence: float,
         test_results: dict[str, Any] | None = None,
+        parser_id: str | None = None,
     ) -> ParserRecord:
         """Register a new CANDIDATE parser in DB."""
         now = datetime.now(timezone.utc)
         record = ParserRecord(
-            parser_id=str(uuid.uuid4()),
+            parser_id=parser_id or str(uuid.uuid4()),
             name=name,
             source=source,
             format_signature=format_signature,
@@ -86,7 +87,7 @@ class ParserRegistry:
         db = await get_db()
         try:
             await db.execute(
-                """INSERT INTO parsers 
+                """INSERT OR REPLACE INTO parsers 
                    (parser_id, name, source, format_signature, parser_version,
                     schema_version, status, confidence, spec_json, test_results_json,
                     created_at, updated_at)
@@ -181,7 +182,8 @@ class ParserRegistry:
 
     async def rollback(self, parser_id: str) -> bool:
         """
-        Rollback: set current to ROLLED_BACK, re-activate previous version.
+        Rollback: deactivates the promoted parser and restores the previously ACTIVE compatible parser.
+        Does not assume that rollback always means simply selecting parser_version - 1.
         """
         now = datetime.now(timezone.utc)
         db = await get_db()
@@ -194,8 +196,9 @@ class ParserRegistry:
             if not row:
                 return False
 
-            # Save current to history
             record = self._row_to_record(row)
+
+            # 1. Save current state to history as ROLLED_BACK
             await db.execute(
                 """INSERT INTO parser_history
                    (parser_id, parser_version, status, spec_json, changed_at)
@@ -204,7 +207,14 @@ class ParserRegistry:
                  record.spec.model_dump_json(), now.isoformat()),
             )
 
-            # Find previous version from history
+            # 2. Deactivate the promoted parser
+            await db.execute(
+                """UPDATE parsers SET status = ?, updated_at = ?
+                   WHERE parser_id = ?""",
+                (ParserStatus.ROLLED_BACK.value, now.isoformat(), parser_id),
+            )
+
+            # 3. Look for a previous ACTIVE version of this specific parser in history
             cursor = await db.execute(
                 """SELECT spec_json, parser_version FROM parser_history
                    WHERE parser_id = ? AND status = 'ACTIVE'
@@ -214,6 +224,7 @@ class ParserRegistry:
             prev_row = await cursor.fetchone()
 
             if prev_row:
+                # Restore previous active version for this parser
                 prev_spec_json = prev_row[0]
                 prev_version = prev_row[1]
                 await db.execute(
@@ -223,20 +234,36 @@ class ParserRegistry:
                      prev_spec_json, now.isoformat(), parser_id),
                 )
             else:
-                # No previous version, just mark as rolled back
-                await db.execute(
-                    """UPDATE parsers SET status = ?, updated_at = ?
-                       WHERE parser_id = ?""",
-                    (ParserStatus.ROLLED_BACK.value, now.isoformat(), parser_id),
+                # If this parser was newly introduced (no prior active version),
+                # restore the previously ACTIVE compatible parser for this source/format.
+                cursor = await db.execute(
+                    """SELECT parser_id FROM parsers
+                       WHERE (source = ? OR parser_id = 'firewall_v1')
+                         AND parser_id != ?
+                       ORDER BY updated_at DESC LIMIT 1""",
+                    (record.source, parser_id),
                 )
+                compat_row = await cursor.fetchone()
+                if compat_row:
+                    compat_id = compat_row[0]
+                    await db.execute(
+                        """UPDATE parsers SET status = ?, updated_at = ?
+                           WHERE parser_id = ?""",
+                        (ParserStatus.ACTIVE.value, now.isoformat(), compat_id),
+                    )
 
             await db.commit()
         finally:
             await db.close()
 
-        # Reload everything from DB
+        # 4. Atomically remove from Fast Path engine and reload active state from persistent DB
+        with self._cache_lock:
+            self._cache.pop(parser_id, None)
+            self.fast_path.remove_parser(parser_id)
+
         await self.initialize()
         return True
+
 
     async def get_all(self) -> list[ParserRecord]:
         """Get all parsers from DB."""

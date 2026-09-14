@@ -211,45 +211,51 @@ for log in KNOWN_IDS_LOGS:
 
 
 def get_demo_step_events() -> dict[int, dict]:
-    """Events for the 9-step judge demo sequence."""
+    """Events for the 10-step judge demo sequence."""
     return {
         1: {
-            "raw": "SRC=10.10.1.25 DST=172.16.2.10 PROTO=TCP DPT=443 ACTION=ALLOW",
-            "description": "Known firewall event — should take FAST PATH",
+            "raw": "",
+            "description": "RESET: Reset demo state, registry to initial seed, metrics, and evidence vault.",
         },
         2: {
-            "raw": "SRC_IP=10.10.1.25 DST_IP=172.16.2.10 PROTO=TCP PORT=443 ACT=ALLOW",
-            "description": "Drifted firewall format — FAST PATH MISS, format signature changed",
+            "raw": "SRC=10.10.1.25 DST=172.16.2.10 PROTO=TCP DPT=443 ACTION=ALLOW",
+            "description": "SEND KNOWN V1: Fast Path hit, zero Tier-3 AI invocations.",
         },
         3: {
             "raw": "SRC_IP=10.10.1.25 DST_IP=172.16.2.10 PROTO=TCP PORT=443 ACT=ALLOW",
-            "description": "Same drifted event — structural analysis + Tier-3 adaptive",
+            "description": "INTRODUCE V2 FORMAT DRIFT: Old parser misses, format signature mismatch → FAST PATH MISS.",
         },
         4: {
             "raw": "SRC_IP=10.10.1.25 DST_IP=172.16.2.10 PROTO=TCP PORT=443 ACT=ALLOW",
-            "description": "Candidate parser created, Trust Gate validation",
+            "description": "RUN SELF-HEALING / ADAPTIVE PIPELINE: BDPT → Structural Analysis → Semantic Uncertainty → Tier-3 → Parser Safety → Trust Gate APPROVED.",
         },
         5: {
-            "raw": "SRC_IP=10.10.1.25 DST_IP=172.16.2.10 PROTO=TCP PORT=443 ACT=ALLOW",
-            "description": "Trust Gate checks",
+            "raw": "",
+            "description": "PROMOTE: Transition Candidate → ACTIVE in SQLite + atomic cache swap.",
         },
         6: {
             "raw": "SRC_IP=10.10.1.25 DST_IP=172.16.2.10 PROTO=TCP PORT=443 ACT=ALLOW",
-            "description": "Parser promotion: CANDIDATE → ACTIVE",
+            "description": "REPLAY SAME V2: Handled by Fast Path with zero AI invocations.",
         },
         7: {
-            "raw": "SRC_IP=192.168.1.100 DST_IP=10.0.0.1 PROTO=UDP PORT=53 ACT=ALLOW",
-            "description": "Replay with new drifted event — should take FAST PATH, zero Tier-3 invocations",
+            "raw": "",
+            "description": "SHOW PROVENANCE: Full lineage trace (Raw Event → SHA-256 → Parser Version → OCSF).",
         },
         8: {
-            "raw": "SRC_IP=10.10.1.25 DST_IP=172.16.2.10 PROTO=TCP PORT=443 ACT=ALLOW",
-            "description": "Show provenance: RAW → SHA-256 → PARSER → OCSF",
+            "raw": "",
+            "description": "TAMPER CHECK: Modify raw evidence byte → Merkle root mismatch → INTEGRITY FAILURE.",
         },
         9: {
+            "raw_invalid_ip": "SRC_IP=999.999.999.999 DST_IP=172.16.2.10 PROTO=TCP PORT=443 ACT=ALLOW",
+            "raw_invalid_port": "SRC_IP=10.10.1.25 DST_IP=172.16.2.10 PROTO=TCP PORT=99999 ACT=ALLOW",
+            "description": "QUARANTINE VERIFICATION (BOTH TESTS): Test Invalid IP (999.999.999.999) and Invalid Port (99999) separately.",
+        },
+        10: {
             "raw": "",
-            "description": "Tamper detection — modify stored event, verify integrity failure",
+            "description": "ROLLBACK: Deactivates the promoted parser and restores the previously ACTIVE compatible parser.",
         },
     }
+
 
 
 def generate_benchmark_batch(count: int = 100) -> list[str]:
