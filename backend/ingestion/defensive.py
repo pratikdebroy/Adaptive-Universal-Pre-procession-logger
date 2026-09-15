@@ -20,7 +20,9 @@ Classification: IMPLEMENTED
 from __future__ import annotations
 
 import csv
+import datetime
 import io
+import ipaddress
 import json
 import re
 import time
@@ -462,6 +464,305 @@ def check_structural_format(raw_message: str) -> IngestionSafetyResult:
     return IngestionSafetyResult(safe=True, detected_format=detected_format)
 
 
+def is_valid_ip(val: Any) -> tuple[bool, QuarantineReason, str]:
+    """Validate IPv4 or IPv6 address format."""
+    str_val = str(val).strip()
+    is_v6 = ":" in str_val
+    try:
+        ipaddress.ip_address(str_val)
+        return True, QuarantineReason.INVALID_IP, "valid"
+    except ValueError:
+        reason = QuarantineReason.INVALID_IPV6 if is_v6 else QuarantineReason.INVALID_IP
+        return False, reason, f"Invalid IP address format: '{str_val}'"
+
+
+def is_valid_port(val: Any) -> tuple[bool, QuarantineReason, str]:
+    """Validate network port range (0-65535)."""
+    try:
+        port_int = int(str(val).strip())
+        if 0 <= port_int <= 65535:
+            return True, QuarantineReason.INVALID_PORT, "valid"
+        return False, QuarantineReason.INVALID_PORT, f"Port '{val}' out of valid range (0-65535)"
+    except (ValueError, TypeError):
+        return False, QuarantineReason.INVALID_PORT, f"Port '{val}' is not a valid integer"
+
+
+def is_valid_protocol(val: Any) -> tuple[bool, QuarantineReason, str]:
+    """Validate transport protocol against configured allowlist or valid IANA protocol number."""
+    proto_str = str(val).strip().upper()
+    valid_protos = {p.upper() for p in settings.valid_protocols}
+    if proto_str in valid_protos:
+        return True, QuarantineReason.INVALID_PROTOCOL, "valid"
+    if proto_str.isdigit():
+        proto_num = int(proto_str)
+        if 0 <= proto_num <= 255:
+            return True, QuarantineReason.INVALID_PROTOCOL, "valid"
+    return False, QuarantineReason.INVALID_PROTOCOL, f"Protocol '{val}' is not a recognized transport protocol"
+
+
+def is_valid_cidr(val: Any) -> tuple[bool, QuarantineReason, str]:
+    """Validate CIDR network notation."""
+    cidr_str = str(val).strip()
+    try:
+        ipaddress.ip_network(cidr_str, strict=False)
+        return True, QuarantineReason.INVALID_CIDR, "valid"
+    except ValueError:
+        return False, QuarantineReason.INVALID_CIDR, f"Invalid CIDR prefix notation: '{cidr_str}'"
+
+
+MAC_REGEX = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$")
+
+
+def is_valid_mac(val: Any) -> tuple[bool, QuarantineReason, str]:
+    """Validate standard 6-octet MAC address format."""
+    mac_str = str(val).strip()
+    if MAC_REGEX.match(mac_str):
+        return True, QuarantineReason.INVALID_MAC, "valid"
+    return False, QuarantineReason.INVALID_MAC, f"Invalid MAC address format: '{mac_str}'"
+
+
+def is_valid_timestamp(val: Any) -> tuple[bool, QuarantineReason, str]:
+    """Validate timestamp parseability and temporal plausibility."""
+    parsed_ts: float | None = None
+    try:
+        if isinstance(val, (int, float)):
+            parsed_ts = float(val) / 1000.0 if float(val) > 1e11 else float(val)
+        else:
+            str_val = str(val).strip()
+            if re.match(r"^\d+(\.\d+)?$", str_val):
+                num = float(str_val)
+                parsed_ts = num / 1000.0 if num > 1e11 else num
+            else:
+                dt = datetime.datetime.fromisoformat(str_val.replace("Z", "+00:00"))
+                parsed_ts = dt.timestamp()
+    except Exception:
+        parsed_ts = None
+
+    if parsed_ts is None:
+        return False, QuarantineReason.INVALID_TIMESTAMP, f"Cannot parse timestamp format: '{val}'"
+
+    now_ts = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    max_future = now_ts + settings.timestamp_max_future_seconds
+    max_past = now_ts - (settings.timestamp_max_past_years * 365.25 * 86400)
+    if not (max_past <= parsed_ts <= max_future):
+        return False, QuarantineReason.TIMESTAMP_IMPLAUSIBLE, f"Timestamp '{val}' is outside plausible temporal window"
+
+    return True, QuarantineReason.INVALID_TIMESTAMP, "valid"
+
+
+def _extract_fields_for_inspection(event: dict[str, Any] | str) -> dict[str, Any]:
+    """Extract key-value pairs from dict, JSON string, or Key-Value string for pre-parsing security inspection."""
+    if isinstance(event, dict):
+        raw_dict = event
+    elif isinstance(event, str):
+        msg = event.strip()
+        if msg.startswith("{"):
+            try:
+                parsed = json.loads(msg)
+                if isinstance(parsed, dict):
+                    raw_dict = parsed
+                else:
+                    return {}
+            except Exception:
+                raw_dict = None
+        else:
+            raw_dict = None
+
+        if raw_dict is None:
+            # Extract key=value patterns (both unquoted and quoted values)
+            pairs = re.findall(r'(?:^|\s+)([A-Za-z0-9_.\-]+)=(?:"([^"]*)"|(\S+))', msg)
+            if pairs:
+                extracted: dict[str, Any] = {}
+                for k, v1, v2 in pairs:
+                    val = v1 if v1 != "" else v2
+                    extracted[k] = val
+                return extracted
+            return {}
+    else:
+        return {}
+
+    # Flatten one level for nested objects (e.g. source.ip)
+    flattened: dict[str, Any] = {}
+    for k, v in raw_dict.items():
+        flattened[k] = v
+        if isinstance(v, dict):
+            for sub_k, sub_v in v.items():
+                flattened[f"{k}.{sub_k}"] = sub_v
+                flattened[f"{k}_{sub_k}"] = sub_v
+    return flattened
+
+
+def get_field_case_insensitive(event_dict: dict[str, Any], aliases: list[str]) -> tuple[str | None, Any]:
+    """
+    Search for a field in event_dict matching any of the aliases (case-insensitive).
+    Returns (matched_key, value) ONLY if the field is present and non-empty.
+    If the field is absent, returns (None, None).
+    """
+    lower_map = {str(k).lower(): (k, v) for k, v in event_dict.items()}
+    for alias in aliases:
+        alias_lower = alias.lower()
+        if alias_lower in lower_map:
+            actual_key, val = lower_map[alias_lower]
+            if val is not None and str(val).strip() != "":
+                return actual_key, val
+    return None, None
+
+
+# Unambiguous / Confidently Known Semantic Field Names
+# Only fields whose names explicitly and unambiguously denote their semantic type
+# are validated at generic ingestion. Ambiguous fields (e.g. "source", "destination",
+# "client", "server", "port", "time", "date") must NEVER be guessed or forced as
+# a semantic type during generic ingestion.
+EXPLICIT_IP_KEYS: set[str] = {
+    "source.ip", "destination.ip", "src_ip", "dst_ip", "source_ip", "destination_ip",
+    "srcip", "dstip", "client_ip", "server_ip", "remote_ip",
+    "source_ipv4", "destination_ipv4", "source_ipv6", "destination_ipv6",
+}
+
+EXPLICIT_PORT_KEYS: set[str] = {
+    "source.port", "destination.port", "src_port", "dst_port",
+    "source_port", "destination_port", "sport", "dport", "dest_port",
+    "spt", "dpt", "port",
+}
+
+EXPLICIT_PROTOCOL_KEYS: set[str] = {
+    "network.transport", "transport_protocol", "ip_protocol", "proto", "protocol",
+}
+
+EXPLICIT_MAC_KEYS: set[str] = {
+    "source.mac", "destination.mac", "src_mac", "dst_mac",
+    "source_mac", "destination_mac",
+}
+
+EXPLICIT_CIDR_KEYS: set[str] = {
+    "source.cidr", "destination.cidr", "src_cidr", "dst_cidr", "network_cidr", "cidr",
+}
+
+EXPLICIT_TIMESTAMP_KEYS: set[str] = {
+    "event_timestamp", "event_time", "timestamp", "@timestamp",
+}
+
+
+def check_field_level_security(event: dict[str, Any] | str, source: str = "unknown") -> IngestionSafetyResult:
+    """
+    Validates field-level security constraints on raw/processing events BEFORE parsing.
+
+    DECISION MODEL (SIH26156 Core Principle):
+    - FIELD ABSENT
+        → PROCEED
+    - FIELD PRESENT + TYPE/SEMANTICS CONFIDENTLY KNOWN
+        → VALIDATE
+        → valid   → PROCEED
+        → invalid → QUARANTINE
+    - FIELD PRESENT + TYPE/SEMANTICS UNKNOWN/AMBIGUOUS
+        → DO NOT FORCE VALIDATION
+        → PROCEED TO NORMAL PARSING / STRUCTURAL ANALYSIS
+
+    Generic ingestion safety is schema-agnostic: it does NOT infer that an arbitrary
+    field like 'source=server.go:1347' or 'description="port 70000"' is an IP or port.
+    """
+    fields = _extract_fields_for_inspection(event)
+    if not fields:
+        return IngestionSafetyResult(safe=True)
+
+    for key, val in fields.items():
+        if val is None or str(val).strip() == "":
+            continue
+
+        k_norm = str(key).strip().lower()
+
+        # 1. Confidently Known IP fields
+        if k_norm in EXPLICIT_IP_KEYS:
+            valid, reason, detail = is_valid_ip(val)
+            if not valid:
+                return IngestionSafetyResult(
+                    safe=False,
+                    reason=reason,
+                    failed_check=f"field.ip:{key}",
+                    severity=QuarantineSeverity.HIGH,
+                    detail=f"Invalid IP address in explicitly typed field '{key}': {detail}",
+                    metadata={"source": source, "field": key, "value": str(val)},
+                )
+
+        # 2. Confidently Known Port fields
+        elif k_norm in EXPLICIT_PORT_KEYS:
+            # If key is generically named "port", only validate if value looks numeric
+            # (e.g. PORT=99999 or PORT=-1); do not force TCP/UDP port validation on
+            # interface names like port=eth0 or port=GigabitEthernet0/1.
+            if k_norm == "port":
+                val_str = str(val).strip().lstrip("-")
+                if not val_str.isdigit():
+                    continue
+            valid, reason, detail = is_valid_port(val)
+            if not valid:
+                return IngestionSafetyResult(
+                    safe=False,
+                    reason=reason,
+                    failed_check=f"field.port:{key}",
+                    severity=QuarantineSeverity.MEDIUM,
+                    detail=f"Invalid port in explicitly typed field '{key}': {detail}",
+                    metadata={"source": source, "field": key, "value": str(val)},
+                )
+
+        # 3. Confidently Known Protocol fields
+        elif k_norm in EXPLICIT_PROTOCOL_KEYS:
+            valid, reason, detail = is_valid_protocol(val)
+            if not valid:
+                return IngestionSafetyResult(
+                    safe=False,
+                    reason=reason,
+                    failed_check=f"field.protocol:{key}",
+                    severity=QuarantineSeverity.MEDIUM,
+                    detail=f"Invalid transport protocol in explicitly typed field '{key}': {detail}",
+                    metadata={"source": source, "field": key, "value": str(val)},
+                )
+
+        # 4. Confidently Known MAC fields
+        elif k_norm in EXPLICIT_MAC_KEYS:
+            valid, reason, detail = is_valid_mac(val)
+            if not valid:
+                return IngestionSafetyResult(
+                    safe=False,
+                    reason=reason,
+                    failed_check=f"field.mac:{key}",
+                    severity=QuarantineSeverity.MEDIUM,
+                    detail=f"Invalid MAC address in explicitly typed field '{key}': {detail}",
+                    metadata={"source": source, "field": key, "value": str(val)},
+                )
+
+        # 5. Confidently Known CIDR fields
+        elif k_norm in EXPLICIT_CIDR_KEYS:
+            valid, reason, detail = is_valid_cidr(val)
+            if not valid:
+                return IngestionSafetyResult(
+                    safe=False,
+                    reason=reason,
+                    failed_check=f"field.cidr:{key}",
+                    severity=QuarantineSeverity.MEDIUM,
+                    detail=f"Invalid CIDR prefix in explicitly typed field '{key}': {detail}",
+                    metadata={"source": source, "field": key, "value": str(val)},
+                )
+
+        # 6. Confidently Known Timestamp fields
+        elif k_norm in EXPLICIT_TIMESTAMP_KEYS:
+            valid, reason, detail = is_valid_timestamp(val)
+            if not valid:
+                return IngestionSafetyResult(
+                    safe=False,
+                    reason=reason,
+                    failed_check=f"field.timestamp:{key}",
+                    severity=QuarantineSeverity.LOW,
+                    detail=f"Invalid timestamp in explicitly typed field '{key}': {detail}",
+                    metadata={"source": source, "field": key, "value": str(val)},
+                )
+
+        # Unknown / ambiguous semantics -> do NOT force validation -> proceed
+        else:
+            continue
+
+    return IngestionSafetyResult(safe=True)
+
+
 def run_ingestion_safety_checks(
     raw_event: RawEvent,
     rate_limiter: SourceRateLimiter | None = None,
@@ -472,6 +773,7 @@ def run_ingestion_safety_checks(
     1. Transport & Framing (empty, binary encoding, syslog framing)
     2. Resource & DoS Protection (size, rate limiting, burst limits)
     3. Structural / Format (JSON, XML, CSV, KV, syntax and nesting validation)
+    4. Field-level Security (presence-guarded: missing -> proceed, present+invalid -> quarantine)
 
     Returns IngestionSafetyResult.
     """
@@ -491,6 +793,12 @@ def run_ingestion_safety_checks(
     struct_res = check_structural_format(message)
     if not struct_res.safe:
         return struct_res
+
+    # Step 4: Field-level Security Checks (Missing -> Proceed, Present+Invalid -> Quarantine)
+    field_res = check_field_level_security(message, raw_event.source)
+    if not field_res.safe:
+        field_res.detected_format = struct_res.detected_format
+        return field_res
 
     # Passed all checks
     return IngestionSafetyResult(safe=True, detected_format=struct_res.detected_format)

@@ -80,20 +80,23 @@ class StructuralToken(BaseModel):
 
 # Maps known field name patterns to OCSF-compatible target fields
 # These are used as EVIDENCE, not as certainty.
+# Ambiguous names like "source", "destination", "client", "server" are intentionally excluded:
+# they only map to source.ip/destination.ip if value-type inference confirms an IP address.
 FIELD_NAME_MAP: dict[str, str] = {
     "src": "source.ip",
     "src_ip": "source.ip",
-    "source": "source.ip",
     "srcip": "source.ip",
     "source_ip": "source.ip",
     "saddr": "source.ip",
+    "client_ip": "source.ip",
+    "remote_ip": "source.ip",
     "dst": "destination.ip",
     "dst_ip": "destination.ip",
-    "dest": "destination.ip",
+    "dest_ip": "destination.ip",
     "dstip": "destination.ip",
-    "destination": "destination.ip",
     "destination_ip": "destination.ip",
     "daddr": "destination.ip",
+    "server_ip": "destination.ip",
     "proto": "network.transport",
     "protocol": "network.transport",
     "dpt": "destination.port",
@@ -111,13 +114,16 @@ FIELD_NAME_MAP: dict[str, str] = {
     "message": "message",
     "time": "time",
     "timestamp": "time",
-    "client": "source.ip",
-    "server": "destination.ip",
-    "remote_ip": "source.ip",
     "user": "source.hostname",
     "method": "message",
     "rule": "rule.uid",
     "uri": "message",
+    "level": "severity",
+    "service": "message",
+    "component": "message",
+    "event": "message",
+    "task": "message",
+    "path": "message",
 }
 
 # Maps OCSF targets to field types
@@ -257,9 +263,23 @@ class StructuralAnalyzer:
                     field_type = TARGET_TYPE_MAP.get(target, "string")
                 elif alias_target:
                     # Key found in alias map but NOT in any active parser
-                    evidence_type = EvidenceType.ALIAS_MATCH
-                    target = alias_target
-                    field_type = TARGET_TYPE_MAP.get(target, "string")
+                    # Guard: If alias target is IP or PORT, verify value type compatibility
+                    if alias_target in ("source.ip", "destination.ip") and value_tok.value_type != ValueType.IP:
+                        evidence_type = EvidenceType.UNRESOLVED
+                        target = "message"
+                        field_type = "string"
+                    elif alias_target in ("source.port", "destination.port") and value_tok.value_type != ValueType.PORT:
+                        evidence_type = EvidenceType.UNRESOLVED
+                        target = "message"
+                        field_type = "string"
+                    elif key_lower == "status" and value_tok.value_type != ValueType.ACTION:
+                        evidence_type = EvidenceType.ALIAS_MATCH
+                        target = "message"
+                        field_type = "string"
+                    else:
+                        evidence_type = EvidenceType.ALIAS_MATCH
+                        target = alias_target
+                        field_type = TARGET_TYPE_MAP.get(target, "string")
                 elif value_tok.value_type == ValueType.IP:
                     evidence_type = EvidenceType.VALUE_TYPE_INFERENCE
                     target = "source.ip" if "src" in key_lower or "source" in key_lower else "destination.ip"
@@ -278,7 +298,7 @@ class StructuralAnalyzer:
                     field_type = "action"
                 else:
                     evidence_type = EvidenceType.UNRESOLVED
-                    target = key_lower
+                    target = "message"
                     field_type = "string"
 
                 weight = EVIDENCE_WEIGHTS[evidence_type]

@@ -22,6 +22,7 @@ from backend.models import (
     ProcessingMode, ValidationResult, QuarantineReason, QuarantineSeverity,
     ProcessedEventResponse, PipelineStageInfo, RawEvent,
     ParsedFields, ParserSpecification, QuarantineEntry,
+    TrustGateResult, ValidationCheck,
 )
 from backend.storage.evidence_vault import EvidenceVault, create_processing_copy
 from backend.ingestion.defensive import (
@@ -80,6 +81,21 @@ class PipelineOrchestrator:
 
         # Initialize registry
         self.registry = ParserRegistry(self.fast_path)
+
+        # Ensure only known baseline parsers exist from start (remove any leftover adaptive parsers from previous sessions)
+        try:
+            db = await get_db()
+            try:
+                placeholders = ",".join("?" * len(KNOWN_PARSERS))
+                await db.execute(
+                    f"DELETE FROM parsers WHERE parser_id NOT IN ({placeholders})",
+                    tuple(KNOWN_PARSERS.keys()),
+                )
+                await db.commit()
+            finally:
+                await db.close()
+        except Exception as e:
+            logger.warning(f"Error cleaning leftover adaptive parsers on startup: {e}")
 
         # Seed known parsers
         for parser_id, (name, spec) in KNOWN_PARSERS.items():
@@ -473,6 +489,17 @@ class PipelineOrchestrator:
 
         resolved_failures = validation.failure_reasons if validation and validation.failure_reasons else [detail]
         resolved_failed_check = failed_check or (validation.failed_check_name if validation and validation.failed_check_name else reason.value)
+
+        if validation is None:
+            validation = TrustGateResult(
+                result=ValidationResult.QUARANTINED,
+                passed=False,
+                checks=[ValidationCheck(check_name=resolved_failed_check, passed=False, detail=detail)],
+                failure_reasons=resolved_failures,
+                primary_reason=reason,
+                primary_severity=severity,
+                failed_check_name=resolved_failed_check,
+            )
 
         entry = QuarantineEntry(
             event_id=raw_event.event_id,

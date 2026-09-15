@@ -19,6 +19,8 @@ from backend.models import (
 )
 from backend.ingestion.defensive import (
     check_transport_and_framing, check_resource_limits, check_structural_format, SourceRateLimiter,
+    check_field_level_security, is_valid_ip, is_valid_port, is_valid_protocol,
+    is_valid_cidr, is_valid_mac, is_valid_timestamp,
 )
 from backend.validation.trust_gate import ParserSafetyValidator, HybridTrustGate
 
@@ -279,3 +281,264 @@ async def test_quarantine_persistence_and_sha256():
     assert resp.raw_sha256 == expected_hash
     assert resp.quarantine.raw_sha256 == expected_hash
     assert resp.quarantine.reason == QuarantineReason.MALFORMED_JSON
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Defensive Ingestion Field-Level Security Regression Tests (SIH26156)
+# Rule: MISSING FIELD -> PROCEED | PRESENT + VALID -> PROCEED | PRESENT + INVALID -> QUARANTINE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_defensive_ingestion_missing_optional_fields_proceed():
+    """
+    Test that absence of ANY optional field is NEVER treated as a security violation.
+    Missing IP, missing port, missing protocol, missing timestamp, missing MAC, missing CIDR -> all PROCEED.
+    """
+    # 1. Missing optional IP (only port and proto present)
+    res_no_ip = check_field_level_security("PROTO=TCP PORT=443 ACTION=ALLOW")
+    assert res_no_ip.safe is True, "Missing IP must not quarantine at ingestion"
+
+    # 2. Missing optional port (IP and proto present)
+    res_no_port = check_field_level_security("SRC_IP=10.10.1.25 DST_IP=172.16.2.10 PROTO=TCP ACTION=ALLOW")
+    assert res_no_port.safe is True, "Missing port must not quarantine at ingestion"
+
+    # 3. Missing optional protocol (IP and port present)
+    res_no_proto = check_field_level_security("SRC_IP=10.10.1.25 DST_IP=172.16.2.10 PORT=443 ACTION=ALLOW")
+    assert res_no_proto.safe is True, "Missing protocol must not quarantine at ingestion"
+
+    # 4. Missing timestamp, MAC, and CIDR
+    res_no_extras = check_field_level_security("SRC=192.168.1.10 DST=10.0.0.1 PROTO=UDP DPT=53")
+    assert res_no_extras.safe is True, "Missing optional timestamp/MAC/CIDR must not quarantine at ingestion"
+
+    # 5. Dict format with missing optional fields
+    dict_event = {"action": "ALLOW", "message": "Health check ok"}
+    res_dict = check_field_level_security(dict_event)
+    assert res_dict.safe is True, "Missing all optional network fields must proceed normally"
+
+
+def test_defensive_ingestion_present_valid_values_proceed():
+    """
+    Test that all present, valid network/security fields pass defensive ingestion safety.
+    """
+    # Key-Value format with all valid fields
+    kv_log = (
+        "SRC_IP=192.168.1.50 DST_IP=10.0.0.1 SPORT=54321 PORT=443 PROTO=TCP "
+        "TIMESTAMP=2026-09-15T12:00:00Z SRC_MAC=00:1A:2B:3C:4D:5E CIDR=192.168.1.0/24 ACT=ALLOW"
+    )
+    res_kv = check_field_level_security(kv_log)
+    assert res_kv.safe is True, f"Valid fields failed: {res_kv.detail}"
+
+    # JSON format with valid fields
+    json_log = {
+        "src_ip": "10.0.0.5",
+        "dst_ip": "172.16.1.1",
+        "src_port": 1024,
+        "dst_port": 80,
+        "protocol": "TCP",
+        "timestamp": "2026-09-15T10:00:00Z",
+        "src_mac": "aa:bb:cc:dd:ee:ff",
+        "cidr": "10.0.0.0/8",
+    }
+    res_json = check_field_level_security(json_log)
+    assert res_json.safe is True, f"Valid JSON fields failed: {res_json.detail}"
+
+
+def test_defensive_ingestion_present_invalid_fields_quarantine():
+    """
+    Test that present but invalid/malformed values in optional fields trigger QUARANTINE
+    with the exact expected QuarantineReason.
+    """
+    # 1. Present Invalid IP -> INVALID_IP
+    res_bad_ip = check_field_level_security("SRC_IP=999.999.999.999 DST_IP=10.0.0.1 PROTO=TCP")
+    assert res_bad_ip.safe is False
+    assert res_bad_ip.reason == QuarantineReason.INVALID_IP
+    assert res_bad_ip.severity == QuarantineSeverity.HIGH
+    assert "999.999.999.999" in res_bad_ip.detail
+
+    # 2. Present Invalid Port -> INVALID_PORT
+    res_bad_port = check_field_level_security("SRC_IP=10.0.0.1 DST_IP=10.0.0.2 PORT=99999 PROTO=TCP")
+    assert res_bad_port.safe is False
+    assert res_bad_port.reason == QuarantineReason.INVALID_PORT
+    assert "99999" in res_bad_port.detail
+
+    # 3. Present Negative Port -> INVALID_PORT
+    res_neg_port = check_field_level_security("SRC_IP=10.0.0.1 SPORT=-1")
+    assert res_neg_port.safe is False
+    assert res_neg_port.reason == QuarantineReason.INVALID_PORT
+
+    # 4. Present Invalid Protocol -> INVALID_PROTOCOL
+    res_bad_proto = check_field_level_security("SRC_IP=10.0.0.1 PROTO=FAKE_PROTO")
+    assert res_bad_proto.safe is False
+    assert res_bad_proto.reason == QuarantineReason.INVALID_PROTOCOL
+
+    # 5. Present Invalid MAC -> INVALID_MAC
+    res_bad_mac = check_field_level_security("SRC_IP=10.0.0.1 SRC_MAC=NOT_A_MAC")
+    assert res_bad_mac.safe is False
+    assert res_bad_mac.reason == QuarantineReason.INVALID_MAC
+
+    # 6. Present Invalid CIDR -> INVALID_CIDR
+    res_bad_cidr = check_field_level_security("SRC_IP=10.0.0.1 CIDR=999.999.999.0/99")
+    assert res_bad_cidr.safe is False
+    assert res_bad_cidr.reason == QuarantineReason.INVALID_CIDR
+
+    # 7. Present Unparseable Timestamp -> INVALID_TIMESTAMP
+    res_bad_time = check_field_level_security("SRC_IP=10.0.0.1 TIMESTAMP=not-a-timestamp")
+    assert res_bad_time.safe is False
+    assert res_bad_time.reason == QuarantineReason.INVALID_TIMESTAMP
+
+    # 8. Present Implausible Timestamp -> TIMESTAMP_IMPLAUSIBLE
+    res_future_time = check_field_level_security("SRC_IP=10.0.0.1 TIMESTAMP=3099-01-01T00:00:00Z")
+    assert res_future_time.safe is False
+    assert res_future_time.reason == QuarantineReason.TIMESTAMP_IMPLAUSIBLE
+
+
+@pytest.mark.asyncio
+async def test_end_to_end_ingestion_field_presence_and_absence():
+    """
+    End-to-end pipeline test verifying:
+    - Missing optional fields do NOT trigger ingestion quarantine
+    - Present invalid fields DO trigger ingestion quarantine
+    - Malformed input still triggers unconditional structural quarantine
+    - Oversized event still triggers unconditional resource quarantine
+    - Valid malicious security logs do NOT get quarantined
+    """
+    await reset_db()
+    await pipeline.initialize()
+
+    # 1. Missing optional port and protocol does NOT trigger ingestion quarantine
+    log_missing_optional = "SRC=10.10.1.25 DST=172.16.2.10 ACTION=ALLOW"
+    resp1 = await pipeline.process_event(log_missing_optional, source="firewall")
+    # Should not be quarantined by ingestion safety checks
+    assert resp1.quarantine is None or resp1.quarantine.reason not in (
+        QuarantineReason.INVALID_PORT, QuarantineReason.INVALID_PROTOCOL, QuarantineReason.INVALID_IP
+    )
+
+    # 2. Present invalid IP quarantines at Stage 2 with INVALID_IP
+    bad_ip = "SRC_IP=999.999.999.999 DST_IP=172.16.2.10 PROTO=TCP PORT=443 ACT=ALLOW"
+    resp2 = await pipeline.process_event(bad_ip, source="firewall")
+    assert resp2.quarantine is not None
+    assert resp2.quarantine.reason == QuarantineReason.INVALID_IP
+    assert resp2.validation is not None
+    assert resp2.validation.result == ValidationResult.QUARANTINED
+
+    # 3. Present invalid port quarantines at Stage 2 with INVALID_PORT
+    bad_port = "SRC_IP=10.10.1.25 DST_IP=172.16.2.10 PROTO=TCP PORT=99999 ACT=ALLOW"
+    resp3 = await pipeline.process_event(bad_port, source="firewall")
+    assert resp3.quarantine is not None
+    assert resp3.quarantine.reason == QuarantineReason.INVALID_PORT
+    assert resp3.validation is not None
+    assert resp3.validation.result == ValidationResult.QUARANTINED
+
+    # 4. Existing structural malformed JSON still quarantines unconditionally
+    resp_malformed = await pipeline.process_event('{"bad": json}', source="test")
+    assert resp_malformed.quarantine is not None
+    assert resp_malformed.quarantine.reason == QuarantineReason.MALFORMED_JSON
+
+    # 5. Existing oversized event (>64KB) still quarantines unconditionally
+    resp_oversized = await pipeline.process_event("A" * 70000, source="test")
+    assert resp_oversized.quarantine is not None
+    assert resp_oversized.quarantine.reason == QuarantineReason.EVENT_TOO_LARGE
+
+    # 6. Valid malicious activity log (e.g. DENY SSH scan) is NOT quarantined
+    attack_log = "SRC=10.0.0.5 DST=10.0.0.10 PROTO=TCP DPT=22 ACTION=DENY"
+    resp_attack = await pipeline.process_event(attack_log, source="firewall")
+    assert resp_attack.quarantine is None
+    assert resp_attack.validation.result == ValidationResult.APPROVED
+
+
+@pytest.mark.asyncio
+async def test_heterogeneous_logs_decision_model():
+    """
+    Comprehensive regression tests for schema-agnostic generic ingestion and decision model:
+    - FIELD ABSENT -> PROCEED
+    - FIELD PRESENT + TYPE/SEMANTICS CONFIDENTLY KNOWN -> VALIDATE (valid -> PROCEED, invalid -> QUARANTINE)
+    - FIELD PRESENT + TYPE/SEMANTICS UNKNOWN/AMBIGUOUS -> DO NOT FORCE VALIDATION -> PROCEED
+    - UNCONDITIONAL INGESTION VIOLATION -> QUARANTINE
+    """
+    await reset_db()
+    await pipeline.initialize()
+
+    # Category 1: Application log with source=server.go:1347 -> PROCEED
+    # Must NOT be guessed as an IP address!
+    res_app1 = check_field_level_security("source=server.go:1347 level=info message=started")
+    assert res_app1.safe is True, "source=server.go:1347 must not be treated as an IP"
+    resp_app1 = await pipeline.process_event("source=server.go:1347 level=info message=started", source="app")
+    assert resp_app1.quarantine is None, "source=server.go:1347 must proceed through pipeline"
+
+    # Category 2: Application log with source=nginx -> PROCEED
+    res_app2 = check_field_level_security("source=nginx status=200 path=/index.html")
+    assert res_app2.safe is True, "source=nginx must not be treated as an IP"
+    resp_app2 = await pipeline.process_event("source=nginx status=200 path=/index.html", source="web")
+    assert resp_app2.quarantine is None
+
+    # Category 3: Application log with source=auth-service -> PROCEED
+    res_app3 = check_field_level_security("source=auth-service event=login_success user=alice")
+    assert res_app3.safe is True, "source=auth-service must not be treated as an IP"
+    resp_app3 = await pipeline.process_event("source=auth-service event=login_success user=alice", source="auth")
+    assert resp_app3.quarantine is None
+
+    # Category 4: Arbitrary strings containing numbers like port 70000 -> PROCEED through ingestion
+    res_str = check_field_level_security('service=gateway message="connection failed on port 70000"')
+    assert res_str.safe is True, "String message containing port 70000 must not be treated as port number"
+    resp_str = await pipeline.process_event('service=gateway message="connection failed on port 70000"', source="gateway")
+    assert resp_str.quarantine is None
+
+    # Category 5: Logs without IP fields -> PROCEED
+    res_no_ip = check_field_level_security("service=cron task=backup status=completed duration=45s")
+    assert res_no_ip.safe is True
+    resp_no_ip = await pipeline.process_event("service=cron task=backup status=completed duration=45s", source="cron")
+    assert resp_no_ip.quarantine is None
+
+    # Category 6: Logs without port fields -> PROCEED
+    res_no_port = check_field_level_security("SRC_IP=10.0.0.1 DST_IP=10.0.0.2 PROTO=ICMP")
+    assert res_no_port.safe is True
+    resp_no_port = await pipeline.process_event("SRC_IP=10.0.0.1 DST_IP=10.0.0.2 PROTO=ICMP", source="net")
+    assert resp_no_port.quarantine is None or resp_no_port.quarantine.reason != QuarantineReason.INVALID_PORT
+
+    # Category 7: Logs without protocol fields -> PROCEED
+    res_no_proto = check_field_level_security("SRC_IP=10.0.0.1 DST_IP=10.0.0.2 SRC_PORT=1234 DST_PORT=80")
+    assert res_no_proto.safe is True
+    resp_no_proto = await pipeline.process_event("SRC_IP=10.0.0.1 DST_IP=10.0.0.2 SRC_PORT=1234 DST_PORT=80", source="net")
+    assert resp_no_proto.quarantine is None or resp_no_proto.quarantine.reason != QuarantineReason.INVALID_PROTOCOL
+
+    # Category 8: Explicitly classified source IP with valid value -> PROCEED
+    res_valid_ip = check_field_level_security("source_ip=192.168.1.1 destination_ip=10.0.0.1")
+    assert res_valid_ip.safe is True
+    resp_valid_ip = await pipeline.process_event("source_ip=192.168.1.1 destination_ip=10.0.0.1 action=ALLOW", source="net")
+    assert resp_valid_ip.quarantine is None
+
+    # Category 9: Explicitly classified source IP with invalid value -> QUARANTINE
+    res_bad_ip = check_field_level_security("source_ip=999.999.999.999 destination_ip=10.0.0.1")
+    assert res_bad_ip.safe is False
+    assert res_bad_ip.reason == QuarantineReason.INVALID_IP
+    resp_bad_ip = await pipeline.process_event("source_ip=999.999.999.999 destination_ip=10.0.0.1 action=ALLOW", source="net")
+    assert resp_bad_ip.quarantine is not None
+    assert resp_bad_ip.quarantine.reason == QuarantineReason.INVALID_IP
+
+    # Category 10: Explicitly classified port with valid value -> PROCEED
+    res_valid_port = check_field_level_security("src_ip=10.0.0.1 dst_ip=10.0.0.2 src_port=8080 dst_port=443")
+    assert res_valid_port.safe is True
+
+    # Category 11: Explicitly classified port outside 0-65535 -> QUARANTINE
+    res_bad_port = check_field_level_security("src_ip=10.0.0.1 dst_port=99999")
+    assert res_bad_port.safe is False
+    assert res_bad_port.reason == QuarantineReason.INVALID_PORT
+    resp_bad_port = await pipeline.process_event("src_ip=10.0.0.1 dst_ip=10.0.0.2 dst_port=99999 action=ALLOW", source="net")
+    assert resp_bad_port.quarantine is not None
+    assert resp_bad_port.quarantine.reason == QuarantineReason.INVALID_PORT
+
+    # Category 12: Existing malformed / oversized / rate-limit security violations continue to quarantine
+    res_malformed = check_structural_format('{"unclosed": "brace"')
+    assert res_malformed.safe is False
+    assert res_malformed.reason == QuarantineReason.MALFORMED_JSON
+
+    res_oversized = check_resource_limits("X" * 70000)
+    assert res_oversized.safe is False
+    assert res_oversized.reason == QuarantineReason.EVENT_TOO_LARGE
+
+    # Category 13: Valid security events describing attacks MUST NOT be quarantined
+    attack_event = "SRC=10.0.0.5 DST=10.0.0.10 PROTO=TCP DPT=22 ACTION=DENY"
+    resp_attack = await pipeline.process_event(attack_event, source="firewall")
+    assert resp_attack.quarantine is None
+    assert resp_attack.validation.result == ValidationResult.APPROVED
+
+

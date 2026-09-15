@@ -12,6 +12,7 @@ Classification: IMPLEMENTED (interface + fallback), PROTOTYPE ABSTRACTION (Ollam
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 from abc import ABC, abstractmethod
@@ -25,6 +26,13 @@ from backend.models import InferenceMode, ParserSpecification
 from backend.adaptive.tier2_structural import FIELD_NAME_MAP, TARGET_TYPE_MAP
 
 logger = logging.getLogger(__name__)
+
+ALLOWLISTED_TARGET_FIELDS = {
+    "source.ip", "source.port", "destination.ip", "destination.port",
+    "network.transport", "action", "message", "time", "severity",
+    "rule.uid", "network.interface", "source.hostname", "destination.hostname",
+    "source.mac", "destination.mac", "network.direction", "network.bytes",
+}
 
 
 class FieldResolution(BaseModel):
@@ -116,6 +124,43 @@ class OllamaProvider(SLMProvider):
                     reason = m.get("reason", "SLM inference")
 
                     if src and tgt:
+                        # Extract sample value for this field from structural hints
+                        sample_val = None
+                        for c in structural_hints.get("candidate_mappings", []):
+                            if str(c.get("source_field", "")).lower() == src.lower():
+                                sample_val = str(c.get("value_sample", ""))
+                                break
+
+                        # Semantic Guardrail: verify value matches expected type before mapping to IP or port
+                        if tgt in ("source.ip", "destination.ip"):
+                            is_ip = False
+                            if sample_val:
+                                try:
+                                    ipaddress.ip_address(sample_val.strip())
+                                    is_ip = True
+                                except ValueError:
+                                    is_ip = False
+                            if not is_ip:
+                                tgt = "message"
+                                reason = f"Value '{sample_val}' is not a valid IP; mapped to message"
+
+                        elif tgt in ("source.port", "destination.port"):
+                            is_port = False
+                            if sample_val and str(sample_val).strip().lstrip("-").isdigit():
+                                try:
+                                    p = int(str(sample_val).strip())
+                                    if 0 <= p <= 65535:
+                                        is_port = True
+                                except ValueError:
+                                    is_port = False
+                            if not is_port:
+                                tgt = "message"
+                                reason = f"Value '{sample_val}' is not a valid port; mapped to message"
+
+                        elif tgt not in ALLOWLISTED_TARGET_FIELDS:
+                            tgt = "message"
+                            reason = f"Target '{tgt}' not in allowlist; mapped to message"
+
                         resolved.append(FieldResolution(
                             source_field=src, target_field=tgt,
                             confidence=conf, reason=reason,
@@ -193,6 +238,13 @@ Log line: {log_line}
 Similar historical templates: {template_section}
 
 Valid OCSF target fields: source.ip, destination.ip, source.port, destination.port, network.transport, action, message, time, severity, rule.uid
+
+CRITICAL RULES:
+1. ONLY map to 'source.ip' or 'destination.ip' if the field value is a valid IPv4 or IPv6 address.
+2. ONLY map to 'source.port' or 'destination.port' if the field value is a numeric port (0-65535).
+3. In application logs, fields like 'source=server.go:1347', 'source=nginx', 'source=auth-service' are component/code locations, NOT IP addresses. Map them to 'message'.
+4. Fields like 'level=info' or 'level=debug' represent log level. Map them to 'severity'.
+5. General text fields map to 'message'.
 
 Return a JSON object with this exact structure:
 {{
@@ -286,6 +338,35 @@ class DemoFallbackProvider(SLMProvider):
                         confidence += 0.15
                         reasons.append(f"Historical template: '{hist_key}' mapped to {target}")
                         break
+
+            # Guard: ensure semantic suitability before assigning IP or Port targets
+            if target in ("source.ip", "destination.ip"):
+                is_ip = False
+                if value_sample:
+                    try:
+                        ipaddress.ip_address(str(value_sample).strip())
+                        is_ip = True
+                    except ValueError:
+                        is_ip = False
+                if not is_ip:
+                    target = "message"
+                    reasons.append(f"Value '{value_sample}' is not a valid IP; mapped to message")
+
+            elif target in ("source.port", "destination.port"):
+                is_port = False
+                if value_sample and str(value_sample).strip().lstrip("-").isdigit():
+                    try:
+                        p = int(str(value_sample).strip())
+                        if 0 <= p <= 65535:
+                            is_port = True
+                    except ValueError:
+                        is_port = False
+                if not is_port:
+                    target = "message"
+                    reasons.append(f"Value '{value_sample}' is not a valid numeric port; mapped to message")
+
+            elif target not in ALLOWLISTED_TARGET_FIELDS:
+                target = "message"
 
             # Cap confidence
             confidence = min(confidence, 0.92)
