@@ -329,9 +329,20 @@ class PipelineOrchestrator:
                             )
                             parser_id = record.parser_id
 
-                            # Promote after validation passes below
+                            # Update the BDPT tree with the new template
+                            self.tier1.add_template(message)
+
+                            # Promote immediately since it passed Parser Safety
+                            if auto_promote:
+                                await self.registry.promote(parser_id)
+                                stages.append(PipelineStageInfo(
+                                    name="REGISTRY",
+                                    status="PROMOTED",
+                                    processing_mode="CANDIDATE → ACTIVE",
+                                ))
+
                         except Exception as e:
-                            logger.warning(f"Failed to register candidate: {e}")
+                            logger.warning(f"Failed to register/promote candidate: {e}")
 
                 adaptive_latency = _ms(adaptive_start)
                 self.metrics["adaptive_latencies"].append(adaptive_latency)
@@ -372,10 +383,20 @@ class PipelineOrchestrator:
                     metadata={"failed_value": validation.failed_value} if validation.failed_value is not None else {},
                 )
 
-            # ── Stage 5: NORMALIZE (OCSF) ──
+            # ── Stage 5: PII MASKING ──
+            stage_start = time.perf_counter()
+            from backend.validation.pii_masking import pii_masker
+            masked_fields = pii_masker.mask(parsed.fields)
+            stages.append(PipelineStageInfo(
+                name="PII MASKING",
+                status="COMPLETE",
+                latency_ms=_ms(stage_start),
+            ))
+
+            # ── Stage 6: NORMALIZE (OCSF) ──
             stage_start = time.perf_counter()
             ocsf_event = self.normalizer.normalize(
-                parsed_fields=parsed.fields,
+                parsed_fields=masked_fields,
                 raw_event=raw_event,
                 parser_id=parser_id or "",
                 parser_version=parsed.parser_version,
@@ -388,23 +409,6 @@ class PipelineOrchestrator:
                 latency_ms=_ms(stage_start),
                 processing_mode="OCSF",
             ))
-
-            # ── Stage 6: PROMOTE parser if adaptive ──
-            if (
-                auto_promote
-                and processing_mode in (ProcessingMode.STRUCTURAL, ProcessingMode.TIER3_ADAPTIVE)
-                and parser_id
-                and self.registry
-            ):
-                try:
-                    await self.registry.promote(parser_id)
-                    stages.append(PipelineStageInfo(
-                        name="REGISTRY",
-                        status="PROMOTED",
-                        processing_mode="CANDIDATE → ACTIVE",
-                    ))
-                except Exception as e:
-                    logger.warning(f"Parser promotion failed: {e}")
 
             # ── Save to DB ──
             await self._save_processed(raw_event, parsed, ocsf_event, processing_mode, parser_id, confidence, tier_detail)
@@ -482,6 +486,7 @@ class PipelineOrchestrator:
         failed_check: str = "",
         severity: QuarantineSeverity = QuarantineSeverity.MEDIUM,
         metadata: dict[str, Any] | None = None,
+        processing_mode: ProcessingMode | None = None,
     ) -> ProcessedEventResponse:
         """Send event to quarantine."""
         self.metrics["quarantine_count"] += 1
@@ -555,10 +560,14 @@ class PipelineOrchestrator:
             processing_mode=f"[{severity.value}] {resolved_failed_check}: {detail}",
         ))
 
+        # Infer mode if not explicitly provided
+        if not processing_mode:
+            processing_mode = ProcessingMode.FAST_PATH if any(s.processing_mode == "FAST PATH" for s in stages) else ProcessingMode.TIER3_ADAPTIVE
+
         return ProcessedEventResponse(
             event_id=raw_event.event_id,
             raw_sha256=raw_event.raw_sha256,
-            processing_mode=ProcessingMode.FAST_PATH,
+            processing_mode=processing_mode,
             quarantine=entry,
             tier_detail=f"QUARANTINED: [{severity.value}] {reason.value} ({resolved_failed_check}) — {detail}",
             stages=stages,

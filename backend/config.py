@@ -48,6 +48,7 @@ class Settings(BaseSettings):
         "ACCEPT", "RESET", "allow", "deny", "drop", "block",
         "reject", "permit", "accept", "reset",
         "Allowed", "Denied", "Dropped", "Blocked",
+        "LOGIN", "LOGOUT", "SUCCESS", "FAILURE", "login", "logout", "success", "failed",
     ]
 
     # --- Ollama / Inference ---

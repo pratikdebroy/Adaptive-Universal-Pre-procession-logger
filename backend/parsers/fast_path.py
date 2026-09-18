@@ -88,6 +88,24 @@ class FastPathEngine:
         """Execute a single parser specification against a message."""
         parsed_data: dict[str, Any] = {}
 
+        # 1. Try JSON parsing first
+        import json
+        try:
+            parsed_json = json.loads(message)
+            if isinstance(parsed_json, dict):
+                for source_key, target_field in spec.fields.items():
+                    if source_key in parsed_json:
+                        parsed_data[target_field] = parsed_json[source_key]
+                
+                if spec.fields:
+                    matched = sum(1 for target in spec.fields.values() if target in parsed_data)
+                    confidence = matched / len(spec.fields)
+                else:
+                    confidence = 0.0
+                return parsed_data, confidence
+        except json.JSONDecodeError:
+            pass
+
         if spec.regex_pattern:
             # Regex-based parsing
             try:

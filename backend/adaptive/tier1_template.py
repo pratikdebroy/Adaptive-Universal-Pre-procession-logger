@@ -322,6 +322,10 @@ class Tier1Matcher:
 
         return front_sim, back_sim, overall_sim, drift_tokens
 
+    def add_template(self, message: str) -> None:
+        """Add a new log message to the BDPT miner dynamically."""
+        self.miner.add_log_message(message)
+
     def match(self, message: str) -> tuple[bool, float, dict[str, Any]]:
         """
         Evaluate log message against known templates using Custom BDPT.
