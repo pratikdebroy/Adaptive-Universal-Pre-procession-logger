@@ -11,10 +11,18 @@ venv/
 .coverage
 htmlcov/
 
-# Node / Frontend
+# Rust
+target/
+Cargo.lock
+
+# Node / Frontend / Gateway / UI
 node_modules/
 frontend/node_modules/
 frontend/dist/
+services/gateway/node_modules/
+ui/node_modules/
+ui/.next/
+ui/out/
 .npm
 npm-debug.log*
 yarn-debug.log*
@@ -24,6 +32,7 @@ yarn-error.log*
 data/*.db
 data/*.db-shm
 data/*.db-wal
+data/*.journal
 data/evidence/*
 !data/evidence/.gitkeep
 !data/.gitkeep

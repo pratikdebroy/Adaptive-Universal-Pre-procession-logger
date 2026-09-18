@@ -1,38 +1,81 @@
+version: '3.8'
+
 services:
-  backend:
-    build:
-      context: .
-      dockerfile: backend/Dockerfile
-    container_name: ulfp-backend
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.1.2
+    container_name: aegis-redpanda
+    command:
+      - redpanda start
+      - --smp 1
+      - --memory 512M
+      - --overprovisioned
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+      - --pandaproxy-addr 0.0.0.0:8082
+      - --schema-registry-addr 0.0.0.0:8081
     ports:
-      - "8000:8000"
-    environment:
-      - ULFP_HOST=0.0.0.0
-      - ULFP_PORT=8000
-      - ULFP_INFERENCE_MODE=auto
-      - ULFP_OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - "19092:19092"
+      - "9092:9092"
+      - "8081:8081"
+      - "8082:8082"
     volumes:
-      - ulfp-evidence:/app/data/evidence
-      - ulfp-data:/app/data
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
+      - aegis-redpanda-data:/var/lib/redpanda/data
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: aegis-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - aegis-ollama-data:/root/.ollama
     restart: unless-stopped
 
-  frontend:
+  engine:
     build:
       context: .
-      dockerfile: frontend/Dockerfile
-    container_name: ulfp-frontend
+      dockerfile: crates/Dockerfile
+    container_name: aegis-engine
+    ports:
+      - "8080:8080"
+      - "5140:5140/udp"
+    environment:
+      - RUST_LOG=info
+      - OLLAMA_URL=http://ollama:11434
+    volumes:
+      - aegis-data:/app/data
+    depends_on:
+      - redpanda
+      - ollama
+    restart: unless-stopped
+
+  gateway:
+    build:
+      context: .
+      dockerfile: services/gateway/Dockerfile
+    container_name: aegis-gateway
+    ports:
+      - "4000:4000"
+    environment:
+      - PORT=4000
+      - AEGIS_ENGINE_URL=http://engine:8080
+    depends_on:
+      - engine
+    restart: unless-stopped
+
+  ui:
+    build:
+      context: .
+      dockerfile: ui/Dockerfile
+    container_name: aegis-ui
     ports:
       - "3000:3000"
+    environment:
+      - NODE_ENV=production
     depends_on:
-      backend:
-        condition: service_healthy
+      - gateway
     restart: unless-stopped
 
 volumes:
-  ulfp-evidence:
-  ulfp-data:
+  aegis-redpanda-data:
+  aegis-ollama-data:
+  aegis-data:

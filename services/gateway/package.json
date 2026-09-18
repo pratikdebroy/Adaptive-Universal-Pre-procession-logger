@@ -1,0 +1,16 @@
+{
+  "name": "aegislog-gateway",
+  "version": "1.0.0",
+  "description": "AegisLog WebSocket Gateway and SOC API Proxy",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test tests/gateway.test.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "cors": "^2.8.5",
+    "ws": "^8.18.0",
+    "axios": "^1.7.9"
+  }
+}
