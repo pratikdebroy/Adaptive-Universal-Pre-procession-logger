@@ -51,7 +51,7 @@ export default function LivePipeline() {
   const fetchEvents = useCallback(async () => {
     try {
       const [eventsRes, metricsRes] = await Promise.all([
-        getEvents(30),
+        getEvents(1000),
         getMetrics()
       ]);
 
@@ -354,12 +354,12 @@ export default function LivePipeline() {
           <h2 className="text-sm font-semibold text-white flex items-center gap-2">
             <Layers className="w-4 h-4 text-[#06b6d4]" /> Ingested Telemetry Feed (Live Trace)
           </h2>
-          <span className="text-xs text-[#9ca3af] font-mono">Showing latest {events.length} events</span>
+          <span className="text-xs text-[#9ca3af] font-mono">Showing all {events.length} events</span>
         </div>
 
-        <div className="overflow-x-auto">
-          <table className="w-full text-left text-sm">
-            <thead className="bg-[#0a0e1a] border-b border-[#2d3348] text-[#9ca3af] text-xs uppercase font-mono">
+        <div className="overflow-auto max-h-[600px]">
+          <table className="w-full text-left text-sm relative">
+            <thead className="bg-[#0a0e1a] border-b border-[#2d3348] text-[#9ca3af] text-xs uppercase font-mono sticky top-0 z-10 shadow-sm">
               <tr>
                 <th className="px-4 py-3 font-semibold">Timestamp</th>
                 <th className="px-4 py-3 font-semibold">Source</th>

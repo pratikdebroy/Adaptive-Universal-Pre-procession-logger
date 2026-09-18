@@ -100,7 +100,7 @@ export default function Benchmarks() {
           </div>
 
           <div className="bg-[#1a1f2e] border border-[#ef4444]/30 rounded-lg p-6 text-center">
-            <div className="text-3xl font-bold text-[#ef4444] mb-2">Tier-3 Invocation Rate: {((results.tier3_count / (results.total_events || 1)) * 100).toFixed(1)}%</div>
+            <div className="text-3xl font-bold text-[#ef4444] mb-2">Tier-3 Invocation Rate: {((results.tier3_invocation_count / (results.total_events || 1)) * 100).toFixed(1)}%</div>
             <p className="text-[#9ca3af] text-sm">Percentage of events requiring local SLM + RAG processing</p>
           </div>
         </>
