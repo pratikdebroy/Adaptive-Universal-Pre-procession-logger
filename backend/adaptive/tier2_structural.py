@@ -143,7 +143,7 @@ TARGET_TYPE_MAP: dict[str, str] = {
 }
 
 IP_PATTERN = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
-TIMESTAMP_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}")
+TIMESTAMP_PATTERN = re.compile(r"^(\d{4}-\d{2}-\d{2}|\d{2}:\d{2}:\d{2})")
 
 PROTOCOL_NAMES = {"tcp", "udp", "icmp", "gre", "esp", "ah", "sctp"}
 ACTION_NAMES = {"allow", "deny", "drop", "accept", "block", "reject", "permit",
@@ -407,9 +407,28 @@ class StructuralAnalyzer:
                 source_hint="structural_analysis",
                 confidence=semantic_confidence,
             )
-        elif fields:
+        else:
             import re
             regex_parts = []
+            
+            # If completely unstructured and no typed fields were found, treat all tokens as variables
+            if not fields:
+                for j, t in enumerate(tokens):
+                    key = f"var_{j}"
+                    fields[key] = "message"
+                    field_types[key] = "string"
+                    
+                    mapping = FieldMapping(
+                        source_field=key,
+                        candidate_target="message",
+                        evidence_type=EvidenceType.UNRESOLVED,
+                        evidence_weight=0.0,
+                        value_type=ValueType.STRING,
+                        value_sample=t.token,
+                    )
+                    candidate_mappings.append(mapping)
+                    variables.append(f"{key}   message (UNRESOLVED, weight=0.0)")
+
             for j, t in enumerate(tokens):
                 if f"var_{j}" in fields:
                     regex_parts.append(f"(?P<var_{j}>\\S+)")

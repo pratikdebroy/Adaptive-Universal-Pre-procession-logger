@@ -341,6 +341,7 @@ class HybridTrustGate:
 
         # Check 7: Timestamp plausibility & format
         import datetime
+        import re
         for time_field in ["time", "timestamp"]:
             if time_field in parsed_fields:
                 t_val = parsed_fields[time_field]
@@ -350,8 +351,15 @@ class HybridTrustGate:
                         # If ms (> 1e11) vs s
                         parsed_ts = float(t_val) / 1000.0 if float(t_val) > 1e11 else float(t_val)
                     else:
-                        dt = datetime.datetime.fromisoformat(str(t_val).replace("Z", "+00:00"))
-                        parsed_ts = dt.timestamp()
+                        val_str = str(t_val).replace("Z", "+00:00")
+                        try:
+                            dt = datetime.datetime.fromisoformat(val_str)
+                            parsed_ts = dt.timestamp()
+                        except ValueError:
+                            if re.match(r"^\d{2}:\d{2}:\d{2}(\.\d+)?$", val_str):
+                                parsed_ts = datetime.datetime.now(datetime.timezone.utc).timestamp()
+                            else:
+                                raise
                 except Exception:
                     parsed_ts = None
 

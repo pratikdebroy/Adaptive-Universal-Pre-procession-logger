@@ -173,7 +173,7 @@ class OllamaProvider(SLMProvider):
                     fields = spec_data["fields"]
                     field_types = spec_data.get("field_types", {})
 
-                regex_pattern = spec_data.get("regex_pattern", "")
+                regex_pattern = structural_hints.get("regex_pattern", "")
                 if regex_pattern:
                     template = regex_pattern
                 else:
@@ -247,15 +247,13 @@ Valid OCSF target fields: source.ip, destination.ip, source.port, destination.po
 CRITICAL RULES:
 1. ONLY map to 'source.ip' or 'destination.ip' if the field value is a valid IPv4 or IPv6 address.
 2. ONLY map to 'source.port' or 'destination.port' if the field value is a numeric port (0-65535).
-3. If the log is completely unstructured and free-text (no JSON, no key-value pairs), you MUST provide a 'regex_pattern' with named capture groups like '(?P<source_hostname>\w+)' to extract the values, and map those capture group names in the mappings.
-4. Fields like 'level=info' or 'level=debug' represent log level. Map them to 'severity'.
-5. General text fields map to 'message'.
+3. Fields like 'level=info' or 'level=debug' represent log level. Map them to 'severity'.
+4. General text fields map to 'message'.
 
 Return a JSON object with this exact structure:
 {{
-  "regex_pattern": "(?P<user>\w+) (?P<time>\w+) logins on system (?P<host>\S+)", // ONLY provide this if the log is completely unstructured
   "mappings": [
-    {{"source_field": "<key_or_regex_capture_group>", "target_field": "<ocsf_target>", "confidence": <0.0-1.0>, "reason": "<explanation>"}}
+    {{"source_field": "<key_or_var>", "target_field": "<ocsf_target>", "confidence": <0.0-1.0>, "reason": "<explanation>"}}
   ]
 }}"""
 
