@@ -451,23 +451,11 @@ class PipelineOrchestrator:
         self, message: str, spec: ParserSpecification, mode: ProcessingMode
     ) -> ParsedFields:
         """Execute a parser spec against a message to extract fields."""
-        fields: dict[str, Any] = {}
-        for token in message.split(spec.entry_separator or " "):
-            token = token.strip()
-            sep = spec.field_separator or "="
-            if sep in token:
-                key, value = token.split(sep, 1)
-                key = key.strip()
-                value = value.strip()
-                if key in spec.fields:
-                    fields[spec.fields[key]] = value
-
-        matched = len(fields)
-        total = len(spec.fields) if spec.fields else 1
+        fields, confidence = self.fast_path._execute_spec(message, spec)
         return ParsedFields(
             fields=fields,
             processing_mode=mode,
-            confidence=matched / total if total > 0 else 0.0,
+            confidence=confidence,
         )
 
     def _try_parse_from_template(self, message: str, t1_detail: dict) -> ParsedFields | None:

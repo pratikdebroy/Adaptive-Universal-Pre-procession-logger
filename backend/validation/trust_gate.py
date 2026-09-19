@@ -194,8 +194,6 @@ class HybridTrustGate:
             required = {"source.ip", "destination.ip", "action"}
         elif "network.interface" in parsed_fields and "source.ip" not in parsed_fields:
             required = {"network.interface", "action"}
-        elif "source.ip" in parsed_fields or "destination.ip" in parsed_fields:
-            required = {"source.ip", "destination.ip", "action"}
         else:
             # Generic application or system event: schema-agnostic (do not force network fields)
             required = set()
