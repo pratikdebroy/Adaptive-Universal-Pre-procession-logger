@@ -40,10 +40,11 @@ export default function App() {
       <div className="flex h-screen bg-[#0a0e1a] text-[#e5e7eb] overflow-hidden">
         <aside className="w-64 border-r border-[#2d3348] flex flex-col">
           <div className="p-6 border-b border-[#2d3348]">
-            <h1 className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-[#06b6d4] to-[#14b8a6]">SIH Logger</h1>
-            <p className="text-xs text-[#9ca3af] mt-1 font-mono">SIH26156 · NTRO Framework</p>
+            <h1 className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-[#06b6d4] to-[#14b8a6]">PORT 8080</h1>
+            <p className="text-xs text-[#9ca3af] mt-1 font-mono">SIH26156 — NTRO Framework</p>
           </div>
           <nav className="flex-1 p-4 space-y-2 overflow-y-auto">
+            <NavItem to="/demo" icon={PlayCircle} label="JUDGE DEMO" />
             <NavItem to="/" icon={Activity} label="LIVE PIPELINE" />
             <NavItem to="/adaptive" icon={Cpu} label="ADAPTIVE PARSER" />
             <NavItem to="/onboarding" icon={UploadCloud} label="SOURCE ONBOARDING" />
@@ -51,7 +52,6 @@ export default function App() {
             <NavItem to="/quarantine" icon={ShieldAlert} label="QUARANTINE (DLQ)" />
             <NavItem to="/integrity" icon={ShieldCheck} label="EVIDENCE & INTEGRITY" />
             <NavItem to="/benchmarks" icon={BarChart2} label="BENCHMARKS" />
-            <NavItem to="/demo" icon={PlayCircle} label="JUDGE DEMO" />
           </nav>
           <div className="p-4 border-t border-[#2d3348] bg-[#0a0e1a] text-center space-y-1.5">
             <p className="text-[10px] font-mono text-[#06b6d4] uppercase tracking-wider font-semibold">
