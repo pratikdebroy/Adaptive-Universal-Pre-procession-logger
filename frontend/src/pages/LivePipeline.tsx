@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { processEvent, getEvents, getMetrics } from '../services/api';
+import { processEvent, getEvents, getMetrics, getEvent } from '../services/api';
 import { StatusBadge } from '../components/StatusBadge';
 import { MetricCard } from '../components/MetricCard';
 import { 
@@ -36,6 +36,26 @@ export default function LivePipeline() {
   const [selectedEvent, setSelectedEvent] = useState<any>(null);
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    if (selectedEvent && !selectedEvent.full_data && selectedEvent.event_id) {
+      // Fetch full details if we just clicked a row from list_events
+      getEvent(selectedEvent.event_id)
+        .then(res => {
+          const data = res.data;
+          if (data && data.processed_event) {
+            setSelectedEvent((prev: any) => ({
+              ...prev,
+              full_data: {
+                ocsf_event: data.processed_event.ocsf_json ? JSON.parse(data.processed_event.ocsf_json) : null,
+                validation: data.processed_event.tier_detail ? JSON.parse(data.processed_event.tier_detail).validation : null,
+              }
+            }));
+          }
+        })
+        .catch(err => console.error("Failed to fetch full event details", err));
+    }
+  }, [selectedEvent?.event_id]);
 
   // Dynamic pipeline stages based on metrics and last execution
   const [stages, setStages] = useState<StageInfo[]>([
