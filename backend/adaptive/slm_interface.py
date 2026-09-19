@@ -173,8 +173,12 @@ class OllamaProvider(SLMProvider):
                     fields = spec_data["fields"]
                     field_types = spec_data.get("field_types", {})
 
-                template_parts = [f"{k}=<*>" for k in fields]
-                template = " ".join(template_parts)
+                regex_pattern = spec_data.get("regex_pattern", "")
+                if regex_pattern:
+                    template = regex_pattern
+                else:
+                    template_parts = [f"{k}=<*>" for k in fields]
+                    template = " ".join(template_parts)
 
                 overall_conf = (
                     sum(r.confidence for r in resolved) / len(resolved)
@@ -184,6 +188,7 @@ class OllamaProvider(SLMProvider):
 
                 spec = ParserSpecification(
                     template=template,
+                    regex_pattern=regex_pattern,
                     fields=fields,
                     field_types=field_types,
                     field_separator="=",
@@ -237,19 +242,20 @@ Log line: {log_line}
 
 Similar historical templates: {template_section}
 
-Valid OCSF target fields: source.ip, destination.ip, source.port, destination.port, network.transport, action, message, time, severity, rule.uid
+Valid OCSF target fields: source.ip, destination.ip, source.port, destination.port, network.transport, action, message, time, severity, rule.uid, source.hostname
 
 CRITICAL RULES:
 1. ONLY map to 'source.ip' or 'destination.ip' if the field value is a valid IPv4 or IPv6 address.
 2. ONLY map to 'source.port' or 'destination.port' if the field value is a numeric port (0-65535).
-3. In application logs, fields like 'source=server.go:1347', 'source=nginx', 'source=auth-service' are component/code locations, NOT IP addresses. Map them to 'message'.
+3. If the log is completely unstructured and free-text (no JSON, no key-value pairs), you MUST provide a 'regex_pattern' with named capture groups like '(?P<source_hostname>\w+)' to extract the values, and map those capture group names in the mappings.
 4. Fields like 'level=info' or 'level=debug' represent log level. Map them to 'severity'.
 5. General text fields map to 'message'.
 
 Return a JSON object with this exact structure:
 {{
+  "regex_pattern": "(?P<user>\w+) (?P<time>\w+) logins on system (?P<host>\S+)", // ONLY provide this if the log is completely unstructured
   "mappings": [
-    {{"source_field": "<key>", "target_field": "<ocsf_target>", "confidence": <0.0-1.0>, "reason": "<explanation>"}}
+    {{"source_field": "<key_or_regex_capture_group>", "target_field": "<ocsf_target>", "confidence": <0.0-1.0>, "reason": "<explanation>"}}
   ]
 }}"""
 
@@ -380,9 +386,12 @@ class DemoFallbackProvider(SLMProvider):
             fields[src_field] = target
             field_types[src_field] = TARGET_TYPE_MAP.get(target, "string")
 
-        # Build template
-        template_parts = [f"{k}=<*>" for k in fields]
-        template = " ".join(template_parts)
+        regex_pattern = structural_hints.get("regex_pattern", "")
+        if regex_pattern:
+            template = regex_pattern
+        else:
+            template_parts = [f"{k}=<*>" for k in fields]
+            template = " ".join(template_parts)
 
         overall_confidence = (
             sum(r.confidence for r in resolved) / len(resolved)
@@ -392,6 +401,7 @@ class DemoFallbackProvider(SLMProvider):
 
         spec = ParserSpecification(
             template=template,
+            regex_pattern=regex_pattern,
             fields=fields,
             field_types=field_types,
             field_separator="=",

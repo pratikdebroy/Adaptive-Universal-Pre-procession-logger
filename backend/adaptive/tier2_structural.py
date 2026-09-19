@@ -323,7 +323,52 @@ class StructuralAnalyzer:
                 i += 3
             else:
                 if tok.token_type == TokenType.UNKNOWN:
-                    constants.append(tok.token)
+                    if tok.value_type != ValueType.STRING and tok.value_type != ValueType.UNKNOWN:
+                        key = f"var_{i}"
+                        if tok.value_type == ValueType.IP:
+                            target = "destination.ip" if any(f == "source.ip" for f in fields.values()) else "source.ip"
+                            evidence_type = EvidenceType.VALUE_TYPE_INFERENCE
+                            field_type = "ip"
+                        elif tok.value_type == ValueType.PORT:
+                            target = "destination.port"
+                            evidence_type = EvidenceType.VALUE_TYPE_INFERENCE
+                            field_type = "port"
+                        elif tok.value_type == ValueType.PROTOCOL:
+                            target = "network.transport"
+                            evidence_type = EvidenceType.VALUE_TYPE_INFERENCE
+                            field_type = "protocol"
+                        elif tok.value_type == ValueType.ACTION:
+                            target = "action"
+                            evidence_type = EvidenceType.VALUE_TYPE_INFERENCE
+                            field_type = "action"
+                        elif tok.value_type == ValueType.TIMESTAMP:
+                            target = "time"
+                            evidence_type = EvidenceType.VALUE_TYPE_INFERENCE
+                            field_type = "timestamp"
+                        else:
+                            target = "message"
+                            evidence_type = EvidenceType.UNRESOLVED
+                            field_type = "string"
+
+                        weight = EVIDENCE_WEIGHTS[evidence_type]
+                        evidence_weights.append(weight)
+                        fields[key] = target
+                        field_types[key] = field_type
+
+                        mapping = FieldMapping(
+                            source_field=key,
+                            candidate_target=target,
+                            evidence_type=evidence_type,
+                            evidence_weight=weight,
+                            value_type=tok.value_type,
+                            value_sample=tok.token,
+                        )
+                        candidate_mappings.append(mapping)
+                        variables.append(
+                            f"{key}   {target} ({evidence_type.value}, weight={weight})"
+                        )
+                    else:
+                        constants.append(tok.token)
                 i += 1
 
         # --- Compute dual confidence scores ---
@@ -348,6 +393,7 @@ class StructuralAnalyzer:
         # Always produce a candidate spec if we found KV pairs
         # (Tier-3 can use this even when Tier-2 is not confident)
         spec = None
+        regex_pattern = ""
         if total_kv > 0:
             template_parts = [f"{key}=<*>" for key in fields]
             template = " ".join(template_parts)
@@ -361,6 +407,15 @@ class StructuralAnalyzer:
                 source_hint="structural_analysis",
                 confidence=semantic_confidence,
             )
+        elif fields:
+            import re
+            regex_parts = []
+            for j, t in enumerate(tokens):
+                if f"var_{j}" in fields:
+                    regex_parts.append(f"(?P<var_{j}>\\S+)")
+                else:
+                    regex_parts.append(re.escape(t.token))
+            regex_pattern = "^" + "\\s+".join(regex_parts) + "$"
 
         detail = {
             "tokens": [t.model_dump() for t in tokens],
@@ -371,6 +426,7 @@ class StructuralAnalyzer:
             "semantic_confidence": semantic_confidence,
             "confident": confident,
             "candidate_mappings": [m.model_dump() for m in candidate_mappings],
+            "regex_pattern": regex_pattern,
             "unresolved_fields": [
                 m.source_field for m in candidate_mappings
                 if m.evidence_type in (EvidenceType.ALIAS_MATCH, EvidenceType.VALUE_TYPE_INFERENCE, EvidenceType.UNRESOLVED)
