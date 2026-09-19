@@ -44,11 +44,25 @@ export default function LivePipeline() {
         .then(res => {
           const data = res.data;
           if (data && data.processed_event) {
+            let ocsf_event = null;
+            let validation = null;
+            try {
+              if (data.processed_event.ocsf_json) {
+                ocsf_event = JSON.parse(data.processed_event.ocsf_json);
+              }
+            } catch (e) {}
+            try {
+              if (data.processed_event.tier_detail) {
+                const parsed = JSON.parse(data.processed_event.tier_detail);
+                validation = parsed.validation || null;
+              }
+            } catch (e) {}
+
             setSelectedEvent((prev: any) => ({
               ...prev,
               full_data: {
-                ocsf_event: data.processed_event.ocsf_json ? JSON.parse(data.processed_event.ocsf_json) : null,
-                validation: data.processed_event.tier_detail ? JSON.parse(data.processed_event.tier_detail).validation : null,
+                ocsf_event,
+                validation,
               }
             }));
           }
