@@ -55,7 +55,12 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "qwen2.5:3b"
     ollama_timeout_seconds: int = 60
-    inference_mode: str = "auto"  # "auto", "ollama", "demo_fallback"
+    
+    # --- Groq / Cloud Inference ---
+    groq_api_key: str = ""
+    groq_model: str = "llama3-8b-8192"
+    
+    inference_mode: str = "auto"  # "auto", "groq", "ollama", "demo_fallback"
 
     # --- RAG ---
     rag_top_k: int = 3
@@ -73,7 +78,12 @@ class Settings(BaseSettings):
     port: int = 8000
     cors_origins: list[str] = ["http://localhost:3000", "http://localhost:5173"]
 
-    model_config = {"env_prefix": "ULFP_"}
+    model_config = {
+        "env_prefix": "ULFP_",
+        "env_file": ".env",
+        "env_file_encoding": "utf-8",
+        "extra": "ignore"
+    }
 
 
 settings = Settings()

@@ -102,6 +102,7 @@ class QuarantineReason(str, enum.Enum):
 
 class InferenceMode(str, enum.Enum):
     LOCAL_SLM = "LOCAL_SLM"
+    CLOUD_LLM = "CLOUD_LLM"
     DEMO_FALLBACK = "DEMO_INFERENCE_FALLBACK"
 
 

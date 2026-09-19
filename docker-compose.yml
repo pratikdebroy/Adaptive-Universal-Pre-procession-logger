@@ -1,81 +1,31 @@
-version: '3.8'
-
+version: "3.8"
 services:
-  redpanda:
-    image: docker.redpanda.com/redpandadata/redpanda:v24.1.2
-    container_name: aegis-redpanda
-    command:
-      - redpanda start
-      - --smp 1
-      - --memory 512M
-      - --overprovisioned
-      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
-      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
-      - --pandaproxy-addr 0.0.0.0:8082
-      - --schema-registry-addr 0.0.0.0:8081
-    ports:
-      - "19092:19092"
-      - "9092:9092"
-      - "8081:8081"
-      - "8082:8082"
+  backend:
+    build: 
+      context: .
+      dockerfile: backend.Dockerfile
     volumes:
-      - aegis-redpanda-data:/var/lib/redpanda/data
+      - ./data:/app/data
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+    depends_on:
+      - ollama
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend.Dockerfile
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
 
   ollama:
-    image: ollama/ollama:latest
-    container_name: aegis-ollama
+    image: ollama/ollama
+    volumes:
+      - ollama_data:/root/.ollama
     ports:
       - "11434:11434"
-    volumes:
-      - aegis-ollama-data:/root/.ollama
-    restart: unless-stopped
-
-  engine:
-    build:
-      context: .
-      dockerfile: crates/Dockerfile
-    container_name: aegis-engine
-    ports:
-      - "8080:8080"
-      - "5140:5140/udp"
-    environment:
-      - RUST_LOG=info
-      - OLLAMA_URL=http://ollama:11434
-    volumes:
-      - aegis-data:/app/data
-    depends_on:
-      - redpanda
-      - ollama
-    restart: unless-stopped
-
-  gateway:
-    build:
-      context: .
-      dockerfile: services/gateway/Dockerfile
-    container_name: aegis-gateway
-    ports:
-      - "4000:4000"
-    environment:
-      - PORT=4000
-      - AEGIS_ENGINE_URL=http://engine:8080
-    depends_on:
-      - engine
-    restart: unless-stopped
-
-  ui:
-    build:
-      context: .
-      dockerfile: ui/Dockerfile
-    container_name: aegis-ui
-    ports:
-      - "3000:3000"
-    environment:
-      - NODE_ENV=production
-    depends_on:
-      - gateway
-    restart: unless-stopped
 
 volumes:
-  aegis-redpanda-data:
-  aegis-ollama-data:
-  aegis-data:
+  ollama_data:

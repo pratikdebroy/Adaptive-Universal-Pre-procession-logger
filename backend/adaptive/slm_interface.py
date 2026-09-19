@@ -73,6 +73,101 @@ class SLMProvider(ABC):
         ...
 
 
+class GroqProvider(SLMProvider):
+    """
+    Cloud SLM via Groq API (OpenAI compatible).
+    Blazing fast inference using Llama-3.
+    """
+
+    def get_mode(self) -> InferenceMode:
+        return InferenceMode.CLOUD_LLM
+
+    def get_mode_label(self) -> str:
+        return "CLOUD LLM (Groq)"
+
+    async def infer(
+        self, log_line: str,
+        historical_templates: list[dict],
+        structural_hints: dict,
+    ) -> InferenceResult:
+        prompt = self._build_prompt(log_line, historical_templates, structural_hints)
+
+        if not settings.groq_api_key:
+            raise RuntimeError("groq_api_key is not configured")
+
+        try:
+            async with httpx.AsyncClient(timeout=settings.ollama_timeout_seconds) as client:
+                response = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {settings.groq_api_key}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": settings.groq_model,
+                        "messages": [
+                            {"role": "system", "content": "You are a cybersecurity log parsing AI. You strictly return JSON."},
+                            {"role": "user", "content": prompt}
+                        ],
+                        "response_format": {"type": "json_object"},
+                        "temperature": 0.0
+                    }
+                )
+                response.raise_for_status()
+                result = response.json()
+                
+                content = result["choices"][0]["message"]["content"]
+                spec_data = json.loads(content)
+                mappings = spec_data.get("mappings", [])
+
+                fields = {}
+                field_types = {}
+                for m in mappings:
+                    src_field = m.get("source_field")
+                    target = m.get("target_field")
+                    if src_field and target:
+                        fields[src_field] = target
+                        field_types[src_field] = TARGET_TYPE_MAP.get(target, "string")
+
+                if not fields and structural_hints.get("fields"):
+                    fields = structural_hints["fields"]
+                    field_types = structural_hints.get("field_types", {})
+
+                regex_pattern = structural_hints.get("regex_pattern", "")
+                if regex_pattern:
+                    template = regex_pattern
+                else:
+                    template_parts = [f"{k}=<*>" for k in fields]
+                    template = " ".join(template_parts)
+
+                overall_conf = (
+                    sum(m.get("confidence", 0.0) for m in mappings) / len(mappings)
+                ) if mappings else 0.0
+
+                spec = ParserSpecification(
+                    template=template,
+                    regex_pattern=regex_pattern,
+                    fields=fields,
+                    field_types=field_types,
+                    field_separator="=",
+                    entry_separator=" ",
+                    source_hint="groq_slm",
+                    confidence=overall_conf,
+                )
+                
+                tier_detail = {
+                    "provider": "Groq",
+                    "model": settings.groq_model,
+                    "mappings_generated": mappings,
+                    "prompt_length": len(prompt),
+                }
+
+                return InferenceResult(spec=spec, tier_detail=tier_detail)
+
+        except Exception as e:
+            logger.error(f"Groq API error: {e}")
+            raise
+
 class OllamaProvider(SLMProvider):
     """
     Local SLM via Ollama API.
@@ -458,6 +553,14 @@ async def get_inference_provider(force_refresh: bool = False) -> SLMProvider:
     if mode == "demo_fallback":
         _cached_provider = DemoFallbackProvider()
         return _cached_provider
+
+    if mode == "groq" or (mode == "auto" and settings.groq_api_key):
+        if settings.groq_api_key:
+            _cached_provider = GroqProvider()
+            logger.info("Groq API key detected. Using Cloud LLM (Groq).")
+            return _cached_provider
+        elif mode == "groq":
+            logger.warning("Groq requested but no API key configured. Falling back.")
 
     # Check if Ollama is accessible
     ollama_ok = await check_ollama_availability(force_refresh=force_refresh)
