@@ -46,7 +46,6 @@ export default function App() {
           <nav className="flex-1 p-4 space-y-2 overflow-y-auto">
             <NavItem to="/demo" icon={PlayCircle} label="JUDGE DEMO" />
             <NavItem to="/" icon={Activity} label="LIVE PIPELINE" />
-            <NavItem to="/adaptive" icon={Cpu} label="ADAPTIVE PARSER" />
             <NavItem to="/onboarding" icon={UploadCloud} label="SOURCE ONBOARDING" />
             <NavItem to="/registry" icon={Database} label="PARSER REGISTRY" />
             <NavItem to="/quarantine" icon={ShieldAlert} label="QUARANTINE (DLQ)" />
@@ -84,7 +83,6 @@ export default function App() {
           <div className="flex-1 overflow-auto p-6 relative">
             <Routes>
               <Route path="/" element={<LivePipeline />} />
-              <Route path="/adaptive" element={<AdaptiveParser />} />
               <Route path="/onboarding" element={<Onboarding />} />
               <Route path="/registry" element={<ParserRegistry />} />
               <Route path="/quarantine" element={<Quarantine />} />
