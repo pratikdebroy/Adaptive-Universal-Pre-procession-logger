@@ -111,7 +111,7 @@ export default function LivePipeline() {
       }
     } catch (err: any) {
       console.error('Failed to fetch pipeline state:', err);
-      setErrorBanner('Backend connection failed. Please ensure the backend is running on http://127.0.0.1:8000');
+      setErrorBanner('Backend connection failed. Please ensure the backend is running and accessible.');
     }
   }, []);
 
