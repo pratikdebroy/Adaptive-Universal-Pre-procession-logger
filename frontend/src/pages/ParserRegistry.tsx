@@ -122,8 +122,8 @@ export default function ParserRegistry() {
       </div>
 
       {/* Parsers Table */}
-      <div className="bg-[#1a1f2e] border border-[#2d3348] rounded-lg overflow-hidden">
-        <table className="w-full text-left text-sm">
+      <div className="bg-[#1a1f2e] border border-[#2d3348] rounded-lg overflow-x-auto">
+        <table className="w-full text-left text-sm whitespace-nowrap min-w-[800px]">
           <thead className="bg-[#0a0e1a] border-b border-[#2d3348] text-[#9ca3af]">
             <tr>
               <th className="w-8 px-3 py-3"></th>
