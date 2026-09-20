@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { processEvent, getEvents, getMetrics, getEvent } from '../services/api';
+import { processEvent, getEvents, getMetrics, getEvent, resetDemo } from '../services/api';
 import { StatusBadge } from '../components/StatusBadge';
 import { MetricCard } from '../components/MetricCard';
 import { 
@@ -115,6 +115,15 @@ export default function LivePipeline() {
     }
   }, []);
 
+  const handleResetAndRefresh = async () => {
+    try {
+      await resetDemo();
+      await fetchEvents();
+    } catch (err) {
+      console.error('Failed to reset:', err);
+    }
+  };
+
   useEffect(() => {
     fetchEvents();
     const interval = setInterval(fetchEvents, 3000);
@@ -197,8 +206,8 @@ export default function LivePipeline() {
           </h1>
           <p className="text-xs text-[#9ca3af] mt-0.5">Real-time log stream processing with fast path routing and adaptive healing</p>
         </div>
-        <button
-          onClick={fetchEvents}
+        <button 
+          onClick={handleResetAndRefresh}
           className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-[#1a1f2e] hover:bg-[#2d3348] border border-[#2d3348] rounded-lg text-[#9ca3af] hover:text-white transition-colors"
         >
           <RefreshCw className="w-3.5 h-3.5" /> Refresh
