@@ -1,6 +1,7 @@
 import axios from 'axios';
 
-const api = axios.create({ baseURL: 'https://adaptive-universal-pre-procession-logger.onrender.com/api' });
+const api = axios.create({ baseURL: 'http://localhost:8000/api' });
+// const api = axios.create({ baseURL: 'https://adaptive-universal-pre-procession-logger.onrender.com/api' });
 
 export const processEvent = (raw_message: string, source = 'manual') =>
   api.post('/events/process', { raw_message, source });

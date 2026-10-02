@@ -31,13 +31,15 @@ class ParserRegistry:
     If cache update fails, state is reloaded from persistent registry.
     """
 
-    def __init__(self, fast_path_engine: FastPathEngine):
+    def __init__(self, fast_path_engine: FastPathEngine, tier1_matcher=None):
         self._cache: dict[str, ParserRecord] = {}
         self._cache_lock = threading.Lock()
         self.fast_path = fast_path_engine
+        self.tier1 = tier1_matcher  # Unified BDPT tree (injected by pipeline)
 
     async def initialize(self):
-        """Load all ACTIVE parsers from DB into cache and fast-path engine."""
+        """Load all ACTIVE parsers from DB into cache and fast-path engine.
+        For adaptive parsers, re-link them to the closest structural cluster in the tree."""
         db = await get_db()
         try:
             cursor = await db.execute(
@@ -50,7 +52,14 @@ class ParserRegistry:
             for row in rows:
                 record = self._row_to_record(row)
                 new_cache[record.parser_id] = record
+                # Load spec into FastPathEngine for execution
                 self.fast_path.load_parser(record.parser_id, record.spec)
+                # Re-link to the Tier1Matcher tree if available and not a known baseline parser
+                if self.tier1 and record.source not in ("firewall", "router", "ids"):
+                    # Try to find the closest cluster and attach as variant
+                    cluster, sim = self.tier1.miner.match(record.spec.template or "")
+                    if cluster and sim > 0.3:
+                        cluster.add_variant(record.parser_id)
 
             with self._cache_lock:
                 self._cache = new_cache

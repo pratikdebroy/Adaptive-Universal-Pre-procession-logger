@@ -1,10 +1,16 @@
 """
 Pipeline Orchestrator — the central engine.
 
-Implements the complete processing flow:
-  RAW EVENT → PRESERVE → FAST PATH → FORMAT DRIFT → STRUCTURAL ANALYSIS
-  → TIER-3 ADAPTIVE → PARSER SPECIFICATION → PARSER SAFETY VALIDATION
-  → EVENT TRUST GATE → OCSF → PARSER REGISTRY → FAST PATH REPLAY
+Implements the EXACT architecture from the SIH diagram:
+
+  1. RECEIVE LOG → SHA-256 preserve, processing copy
+  2. STRUCTURE MATCHING USING BDPT → front+back matching, get leaf node
+  3A. If matched → CHECK PARSER VARIANTS WITH TRUST GATE → Fast Path
+  3B. If no match OR no variant → AI-ASSISTED PATH (RAG + LLM)
+      → Trust Gate validates proposed parser
+  4A. Approved → UPDATE PARSER REGISTRY (link variant or new BDPT node)
+  4B. Rejected → QUARANTINE
+  5. NORMALISATION AND SIEM DELIVERY → OCSF, PII masking, Merkle tree
 
 Classification: IMPLEMENTED
 """
@@ -29,7 +35,6 @@ from backend.ingestion.defensive import (
     run_ingestion_safety_checks, SourceRateLimiter, global_rate_limiter,
 )
 from backend.parsers.fast_path import FastPathEngine
-from backend.parsers.format_router import FormatRouter
 from backend.adaptive.tier1_template import Tier1Matcher
 from backend.adaptive.tier2_structural import StructuralAnalyzer
 from backend.adaptive.tier3_slm_rag import Tier3Adaptive
@@ -47,6 +52,7 @@ class PipelineOrchestrator:
     """
     The central processing pipeline.
     Coordinates all stages from raw ingestion to OCSF output.
+    Follows the exact architecture from the SIH diagram.
     """
 
     def __init__(self):
@@ -54,7 +60,6 @@ class PipelineOrchestrator:
         self.vault = EvidenceVault()
         self.rate_limiter = global_rate_limiter
         self.fast_path = FastPathEngine()
-        self.router = FormatRouter(self.fast_path)
         self.tier1 = Tier1Matcher()
         self.structural = StructuralAnalyzer()
         self.rag = ParserRAG()
@@ -79,10 +84,10 @@ class PipelineOrchestrator:
         """Initialize all components. Called on startup."""
         from backend.parsers.templates import KNOWN_PARSERS
 
-        # Initialize registry
-        self.registry = ParserRegistry(self.fast_path)
+        # Initialize registry — pass tier1 so it can re-link adaptive parsers to tree on startup
+        self.registry = ParserRegistry(self.fast_path, tier1_matcher=self.tier1)
 
-        # Ensure only known baseline parsers exist from start (remove any leftover adaptive parsers from previous sessions)
+        # Ensure only known baseline parsers exist from start
         try:
             db = await get_db()
             try:
@@ -97,12 +102,12 @@ class PipelineOrchestrator:
         except Exception as e:
             logger.warning(f"Error cleaning leftover adaptive parsers on startup: {e}")
 
-        # Seed known parsers
+        # Seed known parsers — load spec into FastPathEngine AND structural template into Tier1Matcher tree
         for parser_id, (name, spec) in KNOWN_PARSERS.items():
-            # Load into fast path engine directly
             self.fast_path.load_parser(parser_id, spec)
-
-            # Register in DB if not exists
+            # Inject the clean structural template into the unified BDPT tree
+            if spec.template and "JSON_PAYLOAD" not in spec.template:
+                self.tier1.miner.add_explicit_template(spec.template, parser_id)
             try:
                 existing = await self.registry.get_by_id(parser_id)
                 if not existing:
@@ -139,12 +144,16 @@ class PipelineOrchestrator:
     ) -> ProcessedEventResponse:
         """
         Process a single raw event through the complete pipeline.
-        Returns a full response with all stage information.
+        Follows the exact diagram architecture:
+          1 → 2 → 3A/3B → 4A/4B → 5
         """
         stages: list[PipelineStageInfo] = []
         start_time = time.perf_counter()
 
-        # ── Stage 1: PRESERVE (lossless) ──
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # STEP 1: RECEIVE LOG — Preserve + Ingestion Safety
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
         stage_start = time.perf_counter()
         raw_event = self.vault.preserve(raw_message, source)
         stages.append(PipelineStageInfo(
@@ -154,7 +163,7 @@ class PipelineOrchestrator:
             latency_ms=_ms(stage_start),
         ))
 
-        # ── Stage 2: INGESTION SAFETY CHECKS (Defensive Transport, Resource & Format) ──
+        # Ingestion safety checks (rate limit, size, injection detection)
         stage_start = time.perf_counter()
         safety_res = run_ingestion_safety_checks(raw_event, self.rate_limiter)
         if not safety_res.safe:
@@ -169,11 +178,10 @@ class PipelineOrchestrator:
                 metadata=safety_res.metadata,
             )
 
-        # Create processing copy (sanitization on copy only, raw event is preserved verbatim)
+        # Create processing copy (sanitization on copy only)
         proc_copy = create_processing_copy(raw_event)
         message = proc_copy.sanitized_message
 
-        # Check if message is empty after sanitization
         if not message.strip():
             return await self._quarantine(
                 raw_event=raw_event,
@@ -193,197 +201,263 @@ class PipelineOrchestrator:
             processing_mode=f"format:{safety_res.detected_format}, sanitization:{proc_copy.sanitization_applied if proc_copy.sanitization_applied else 'clean'}",
         ))
 
-        # ── Stage 3: ROUTE — Fast Path or Adaptive ──
-        stage_start = time.perf_counter()
-        route, parsed, parser_id = self.router.route(proc_copy)
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # STEP 2: STRUCTURE MATCHING USING BDPT
+        # Single unified Tier1Matcher tree does routing + variant lookup.
+        # Returns the leaf cluster so the pipeline can try its parser variants.
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+        bdpt_start = time.perf_counter()
+
+        # Use unified Tier1Matcher tree:
+        #   1. Bidirectional structural match (front+back scan)
+        #   2. Returns the matching leaf cluster with variant IDs attached
+        t1_confident, t1_score, bdpt_cluster, t1_detail = self.tier1.match_with_cluster(message)
+
+        fp_parser_id, fp_parsed, fp_confidence = None, None, 0.0
+
+        if bdpt_cluster and bdpt_cluster.has_variants():
+            # Try each variant stored at this leaf node (diagram step 3A)
+            fp_parser_id, fp_parsed, fp_confidence = self.fast_path.try_variants(
+                message, bdpt_cluster.get_variant_ids()
+            )
+
+        structure_matched = fp_parsed is not None and fp_confidence >= settings.fast_path_confidence_threshold
+
         stages.append(PipelineStageInfo(
             name="ROUTE",
-            status="COMPLETE",
-            latency_ms=_ms(stage_start),
-            processing_mode=route,
+            status="BDPT_MATCHED" if structure_matched else "BDPT_MISS",
+            latency_ms=_ms(bdpt_start),
+            processing_mode=f"BDPT: t1_sim={t1_score:.2f}, fp_conf={fp_confidence:.2f}, matched={structure_matched}",
         ))
 
-        tier_detail = ""
+        tier_detail = f"BDPT: {t1_detail.get('status', '')} (sim={t1_score:.2f})"
         processing_mode = ProcessingMode.FAST_PATH
         confidence = 0.0
-        tier3_invocations_this_event = 0
+        parser_id = ""
+        parsed: ParsedFields | None = None
+        self_healing = False
+        best_variant_validation: TrustGateResult | None = None
 
-        if route == "FAST_PATH" and parsed:
-            # ── FAST PATH ──
-            processing_mode = ProcessingMode.FAST_PATH
-            confidence = parsed.confidence
-            tier_detail = f"FAST PATH — parser: {parser_id}"
-            latency = _ms(stage_start)
-            self.metrics["fast_path_count"] += 1
-            self.metrics["fast_path_latencies"].append(latency)
+        if structure_matched and fp_parsed and fp_parser_id:
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # STEP 3A: CHECK PARSER VARIANTS WITH TRUST GATE
+            # BDPT (or regex) matched a parser → validate output with Trust Gate
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-            stages.append(PipelineStageInfo(
-                name="PARSE",
-                status="COMPLETE",
-                latency_ms=latency,
-                processing_mode="FAST PATH",
-            ))
+            variant_start = time.perf_counter()
 
-        else:
-            # ── ADAPTIVE PATH ──
-            adaptive_start = time.perf_counter()
+            # Trust Gate validates the variant's output
+            validation = self.trust_gate.validate(fp_parsed.fields, fp_confidence, source_hint=source)
 
-            # Tier 1: Template matching (BDPT)
-            t1_confident, t1_score, t1_detail = self.tier1.match(message)
-            tier_detail = f"Tier-1: {t1_detail.get('status', '')}"
+            if validation.result == ValidationResult.APPROVED:
+                # ✅ FAST PATH — variant matched and passed Trust Gate
+                processing_mode = ProcessingMode.FAST_PATH
+                parser_id = fp_parser_id
+                confidence = fp_confidence
+                parsed = fp_parsed
+                best_variant_validation = validation
+                tier_detail += f" → FAST PATH (parser={fp_parser_id}, conf={fp_confidence:.2f})"
 
-            stages.append(PipelineStageInfo(
-                name="TIER-1 TEMPLATE",
-                status="MATCHED" if t1_confident else "ESCALATED",
-                latency_ms=_ms(adaptive_start),
-                processing_mode="TEMPLATE MATCHING (BDPT)",
-            ))
-
-            if not t1_confident:
-                # Tier 2: Structural analysis (dual confidence: structural vs semantic)
-                t2_start = time.perf_counter()
-                known_keys = self.fast_path.get_known_keys(source) if self.fast_path else set()
-                t2_confident, t2_score, t2_spec, t2_detail = self.structural.analyze(
-                    message, known_keys
-                )
-                tier_detail += f" → Tier-2: struct_conf={t2_detail.get('structural_confidence', 0):.2f}, sem_conf={t2_score:.2f} (confident={t2_confident})"
+                latency = _ms(variant_start)
+                self.metrics["fast_path_count"] += 1
+                self.metrics["fast_path_latencies"].append(latency)
 
                 stages.append(PipelineStageInfo(
-                    name="TIER-2 STRUCTURAL",
-                    status="PARSED" if t2_confident else "ESCALATED",
-                    latency_ms=_ms(t2_start),
-                    processing_mode="STRUCTURAL ANALYSIS",
+                    name="PARSE",
+                    status="FAST_PATH",
+                    latency_ms=latency,
+                    processing_mode=f"Variant matched: {fp_parser_id}",
                 ))
-
-                if t2_confident and t2_spec:
-                    # Structural analysis produced a spec
-                    processing_mode = ProcessingMode.STRUCTURAL
-                    confidence = t2_score
-                    self.metrics["structural_count"] += 1
-
-                    # Execute the structural spec to get parsed fields
-                    parsed = self._execute_spec(message, t2_spec, ProcessingMode.STRUCTURAL)
-                    parser_id = ""
-
-                    # Try to register as candidate
-                    candidate_spec = t2_spec
-                    candidate_detail = t2_detail
-
-                else:
-                    # Tier 3: SLM/Fallback + RAG
-                    t3_start = time.perf_counter()
-                    t3_spec, t3_conf, t3_detail = await self.tier3.adapt(
-                        message, t2_detail
-                    )
-                    processing_mode = ProcessingMode.TIER3_ADAPTIVE
-                    tier3_invocations_this_event = 1
-                    self.metrics["tier3_count"] += 1
-                    tier_detail += f" → Tier-3: {t3_detail.get('inference_mode', '')}"
-
-                    stages.append(PipelineStageInfo(
-                        name="TIER-3 ADAPTIVE",
-                        status="COMPLETE" if t3_spec else "FAILED",
-                        latency_ms=_ms(t3_start),
-                        processing_mode=t3_detail.get("inference_mode", ""),
-                    ))
-
-                    if t3_spec:
-                        confidence = t3_conf
-                        parsed = self._execute_spec(message, t3_spec, ProcessingMode.TIER3_ADAPTIVE)
-                        parser_id = ""
-                        candidate_spec = t3_spec
-                        candidate_detail = t3_detail
-                    else:
-                        return await self._quarantine(
-                            raw_event, QuarantineReason.UNSUPPORTED_FORMAT,
-                            "All parsing tiers failed", stages
-                        )
-
-                # ── Parser Safety Validation ──
-                if 'candidate_spec' in locals() and candidate_spec:
-                    safety = self.parser_safety.validate_spec(candidate_spec)
-                    stages.append(PipelineStageInfo(
-                        name="PARSER SAFETY",
-                        status="SAFE" if safety.safe else "UNSAFE",
-                    ))
-                    if not safety.safe:
-                        return await self._quarantine(
-                            raw_event=raw_event,
-                            reason=safety.primary_reason,
-                            detail=f"Parser safety check failed: {'; '.join(safety.failure_reasons)}",
-                            stages=stages,
-                            failed_check=safety.failed_check_name or "parser_safety",
-                            severity=safety.primary_severity,
-                        )
-
-                    # Register candidate and promote
-                    if self.registry and parsed:
-                        try:
-                            sig = self.fast_path.compute_format_signature(message)
-                            record = await self.registry.register_candidate(
-                                name=f"adaptive_{sig[:8]}",
-                                source=source,
-                                format_signature=sig,
-                                spec=candidate_spec,
-                                confidence=confidence,
-                            )
-                            parser_id = record.parser_id
-
-                            # Update the BDPT tree with the new template
-                            self.tier1.add_template(message)
-
-                            # Promote immediately since it passed Parser Safety
-                            if auto_promote:
-                                await self.registry.promote(parser_id)
-                                stages.append(PipelineStageInfo(
-                                    name="REGISTRY",
-                                    status="PROMOTED",
-                                    processing_mode="CANDIDATE → ACTIVE",
-                                ))
-
-                        except Exception as e:
-                            logger.warning(f"Failed to register/promote candidate: {e}")
-
-                adaptive_latency = _ms(adaptive_start)
-                self.metrics["adaptive_latencies"].append(adaptive_latency)
-
             else:
-                # Tier 1 matched — this is structural path
-                processing_mode = ProcessingMode.STRUCTURAL
-                confidence = t1_score
-                self.metrics["structural_count"] += 1
+                # BDPT matched but Trust Gate rejected → SELF-HEALING
+                self_healing = True
+                tier_detail += f" → SELF-HEALING (Trust Gate rejected: {'; '.join(validation.failure_reasons)})"
+                stages.append(PipelineStageInfo(
+                    name="PARSE",
+                    status="SELF_HEALING",
+                    latency_ms=_ms(variant_start),
+                    processing_mode="Trust Gate rejected variant, escalating to AI path",
+                ))
+        else:
+            # BDPT and regex both missed — totally new format
+            tier_detail += " → NEW FORMAT (no parser matched)"
 
-                # Still need to parse with fast path or structural
-                parsed = self._try_parse_from_template(message, t1_detail)
-                if not parsed:
-                    known_keys = self.fast_path.get_known_keys(source) if self.fast_path else set()
-                    t2_confident, t2_score, t2_spec, t2_detail = self.structural.analyze(message, known_keys)
-                    if t2_spec:
-                        parsed = self._execute_spec(message, t2_spec, ProcessingMode.STRUCTURAL)
+        if not parsed:
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # STEP 3B: AI-ASSISTED PATH
+            # For new/unknown structures OR self-healing cases
+            # RAG retrieval + LLM inference → propose parser
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-        # ── Stage 4: VALIDATE (Event Trust Gate) ──
-        if parsed and parsed.fields:
-            stage_start = time.perf_counter()
-            validation = self.trust_gate.validate(parsed.fields, confidence, source_hint=source)
+            adaptive_start = time.perf_counter()
+            processing_mode = ProcessingMode.TIER3_ADAPTIVE
+            self.metrics["tier3_count"] += 1
+
+            # Build minimal hints for Tier-3 (tokenization only, NO field guessing)
+            tokens = self.structural.tokenize(message)
+            # bdpt_cluster is already available from Step 2 (may be None for totally new formats)
+            hints = {
+                "tokens": [t.model_dump() for t in tokens],
+                "total_kv_pairs": sum(1 for t in tokens if t.token_type.value == "KEY"),
+                "message": message,
+                "self_healing": self_healing,
+                "bdpt_template": bdpt_cluster.get_template_str() if bdpt_cluster else "",
+                "candidate_mappings": [],  # Empty: let the LLM decide, don't poison with guesses
+                "unresolved_fields": [],
+            }
+
+            # Tier 3: RAG + LLM
+            t3_start = time.perf_counter()
+            t3_spec, t3_conf, t3_detail = await self.tier3.adapt(message, hints)
+            tier_detail += f" → AI Path: {t3_detail.get('inference_mode', '')}"
+
             stages.append(PipelineStageInfo(
-                name="VALIDATE",
-                status=validation.result.value,
-                latency_ms=_ms(stage_start),
+                name="TIER-3 ADAPTIVE",
+                status="COMPLETE" if t3_spec else "FAILED",
+                latency_ms=_ms(t3_start),
+                processing_mode=t3_detail.get("inference_mode", ""),
             ))
 
-            if validation.result == ValidationResult.QUARANTINED:
+            if not t3_spec:
                 return await self._quarantine(
-                    raw_event=raw_event,
-                    reason=validation.primary_reason,
-                    detail="; ".join(validation.failure_reasons),
-                    stages=stages,
-                    validation=validation,
-                    failed_check=validation.failed_check_name,
-                    severity=validation.primary_severity,
-                    metadata={"failed_value": validation.failed_value} if validation.failed_value is not None else {},
+                    raw_event, QuarantineReason.UNSUPPORTED_FORMAT,
+                    "All parsing tiers failed", stages
                 )
 
-            # ── Stage 5: PII MASKING ──
+            # ── Parser Safety Validation ──
+            safety = self.parser_safety.validate_spec(t3_spec)
+            stages.append(PipelineStageInfo(
+                name="PARSER SAFETY",
+                status="SAFE" if safety.safe else "UNSAFE",
+            ))
+            if not safety.safe:
+                return await self._quarantine(
+                    raw_event=raw_event,
+                    reason=safety.primary_reason,
+                    detail=f"Parser safety check failed: {'; '.join(safety.failure_reasons)}",
+                    stages=stages,
+                    failed_check=safety.failed_check_name or "parser_safety",
+                    severity=safety.primary_severity,
+                )
+
+            # Execute the proposed spec to get parsed fields
+            fields, confidence = self.fast_path._execute_spec(message, t3_spec)
+            parsed = ParsedFields(
+                fields=fields,
+                processing_mode=ProcessingMode.TIER3_ADAPTIVE,
+                confidence=confidence,
+            )
+
+            # ── Trust Gate validates the proposed parser output ──
+            if parsed.fields:
+                tg_result = self.trust_gate.validate(parsed.fields, confidence, source_hint=source)
+                stages.append(PipelineStageInfo(
+                    name="VALIDATE",
+                    status=tg_result.result.value,
+                ))
+                if tg_result.result == ValidationResult.QUARANTINED:
+                    return await self._quarantine(
+                        raw_event=raw_event,
+                        reason=tg_result.primary_reason,
+                        detail="; ".join(tg_result.failure_reasons),
+                        stages=stages,
+                        validation=tg_result,
+                        failed_check=tg_result.failed_check_name,
+                        severity=tg_result.primary_severity,
+                        metadata={"failed_value": tg_result.failed_value} if tg_result.failed_value is not None else {},
+                    )
+
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # STEP 4A: UPDATE PARSER REGISTRY
+            # Approved parser → register spec + link as variant at BDPT leaf node
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+            if self.registry and parsed and parsed.fields:
+                try:
+                    sig = self.fast_path.compute_format_signature(message)
+                    record = await self.registry.register_candidate(
+                        name=f"adaptive_{sig[:8]}",
+                        source=source,
+                        format_signature=sig,
+                        spec=t3_spec,
+                        confidence=confidence,
+                    )
+                    parser_id = record.parser_id
+
+                    # Store spec in FastPathEngine (execution only, no tree involvement)
+                    self.fast_path.load_parser(parser_id, t3_spec)
+
+                    if self_healing and bdpt_cluster:
+                        # SELF-HEALING: Link new variant to the existing leaf cluster
+                        bdpt_cluster.add_variant(parser_id)
+                        tier_detail += f" → SELF-HEAL: linked variant {parser_id[:8]} to cluster #{bdpt_cluster.cluster_id}"
+                    else:
+                        # NEW STRUCTURE: Feed raw log into Tier1Matcher tree.
+                        # Tree naturally tokenizes it into real words → creates structural leaf cluster.
+                        # Attach new parser ID as a variant at that leaf. NO regex strings in the tree.
+                        new_cluster = self.tier1.add_template(message)
+                        if new_cluster:
+                            new_cluster.add_variant(parser_id)
+                            tier_detail += f" → NEW TEMPLATE: registered {parser_id[:8]} at cluster #{new_cluster.cluster_id}"
+                        else:
+                            tier_detail += f" → NEW TEMPLATE: registered {parser_id}"
+
+                    # Also add to RAG for future retrieval
+                    self.rag.add_template(parser_id, t3_spec)
+
+                    if auto_promote:
+                        await self.registry.promote(parser_id)
+                        stages.append(PipelineStageInfo(
+                            name="REGISTRY",
+                            status="PROMOTED",
+                            processing_mode="CANDIDATE → ACTIVE" + (" (self-healing)" if self_healing else " (new template)"),
+                        ))
+
+                except Exception as e:
+                    logger.warning(f"Failed to register/promote candidate: {e}")
+
+            adaptive_latency = _ms(adaptive_start)
+            self.metrics["adaptive_latencies"].append(adaptive_latency)
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # STEP 5: NORMALISATION AND SIEM DELIVERY
+        # Extract fields, PII masking, OCSF, Merkle tree
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+        if parsed and parsed.fields:
+            # If we came from fast path, still need to validate through Trust Gate
+            if processing_mode == ProcessingMode.FAST_PATH:
+                stage_start = time.perf_counter()
+                validation = best_variant_validation or self.trust_gate.validate(
+                    parsed.fields, confidence, source_hint=source
+                )
+                stages.append(PipelineStageInfo(
+                    name="VALIDATE",
+                    status=validation.result.value,
+                    latency_ms=_ms(stage_start),
+                ))
+                if validation.result == ValidationResult.QUARANTINED:
+                    return await self._quarantine(
+                        raw_event=raw_event,
+                        reason=validation.primary_reason,
+                        detail="; ".join(validation.failure_reasons),
+                        stages=stages,
+                        validation=validation,
+                        failed_check=validation.failed_check_name,
+                        severity=validation.primary_severity,
+                        metadata={"failed_value": validation.failed_value} if validation.failed_value is not None else {},
+                    )
+            else:
+                # Adaptive path already validated above; reuse
+                validation = TrustGateResult(
+                    result=ValidationResult.APPROVED,
+                    passed=True,
+                    checks=[],
+                    failure_reasons=[],
+                )
+
+            # ── PII MASKING ──
             stage_start = time.perf_counter()
             from backend.validation.pii_masking import pii_masker
             masked_fields = pii_masker.mask(parsed.fields)
@@ -393,7 +467,7 @@ class PipelineOrchestrator:
                 latency_ms=_ms(stage_start),
             ))
 
-            # ── Stage 6: NORMALIZE (OCSF) ──
+            # ── NORMALIZE (OCSF) ──
             stage_start = time.perf_counter()
             ocsf_event = self.normalizer.normalize(
                 parsed_fields=masked_fields,
@@ -438,7 +512,7 @@ class PipelineOrchestrator:
                 tier_detail=tier_detail,
                 stages=stages,
                 inference_mode=get_current_inference_mode(),
-                tier3_invocations=tier3_invocations_this_event,
+                tier3_invocations=1 if processing_mode == ProcessingMode.TIER3_ADAPTIVE else 0,
             )
 
         # Should not reach here normally
@@ -458,11 +532,6 @@ class PipelineOrchestrator:
             confidence=confidence,
         )
 
-    def _try_parse_from_template(self, message: str, t1_detail: dict) -> ParsedFields | None:
-        """Try to parse using fast-path engine after Tier-1 match."""
-        _, parsed, confidence = self.fast_path.parse(message)
-        return parsed
-
     async def _quarantine(
         self,
         raw_event: RawEvent,
@@ -476,7 +545,7 @@ class PipelineOrchestrator:
         metadata: dict[str, Any] | None = None,
         processing_mode: ProcessingMode | None = None,
     ) -> ProcessedEventResponse:
-        """Send event to quarantine."""
+        """Send event to quarantine (Step 4B)."""
         self.metrics["quarantine_count"] += 1
         self.metrics["total_events"] += 1
 
@@ -548,9 +617,8 @@ class PipelineOrchestrator:
             processing_mode=f"[{severity.value}] {resolved_failed_check}: {detail}",
         ))
 
-        # Infer mode if not explicitly provided
         if not processing_mode:
-            processing_mode = ProcessingMode.FAST_PATH if any(s.processing_mode == "FAST PATH" for s in stages) else ProcessingMode.TIER3_ADAPTIVE
+            processing_mode = ProcessingMode.TIER3_ADAPTIVE
 
         return ProcessedEventResponse(
             event_id=raw_event.event_id,
@@ -641,7 +709,6 @@ class PipelineOrchestrator:
             "adaptive_latencies": [],
         }
         self.fast_path = FastPathEngine()
-        self.router = FormatRouter(self.fast_path)
         self.tier1 = Tier1Matcher()
         self.rag = ParserRAG()
         self.tier3 = Tier3Adaptive(self.rag)

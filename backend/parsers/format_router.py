@@ -19,7 +19,11 @@ class FormatRouter:
         Route a processing copy to fast path or adaptive path.
         Returns: (route: 'FAST_PATH'|'ADAPTIVE', parsed_fields, parser_id)
         """
-        parser_id, parsed, confidence = self.fast_path.parse(processing_copy.sanitized_message)
+        # Try all known parser variants
+        all_parser_ids = list(self.fast_path._parsers.keys())
+        parser_id, parsed, confidence = self.fast_path.try_variants(
+            processing_copy.sanitized_message, all_parser_ids
+        )
 
         if parsed and confidence >= settings.fast_path_confidence_threshold:
             return "FAST_PATH", parsed, parser_id or ""

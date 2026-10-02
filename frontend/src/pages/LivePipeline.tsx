@@ -334,7 +334,7 @@ export default function LivePipeline() {
           <button 
             type="button"
             onClick={() => {
-              const log = '{"timestamp": "2026-09-14T01:24:00Z", "level": "INFO", "service": "user-auth", "message": "User login failed"}';
+              const log = 'SRC=999.999.999.999 DST=172.16.2.10 PROTO=TCP DPT=443 ACTION=ALLOW';
               setInputLog(log);
               handleProcess(log);
             }} 

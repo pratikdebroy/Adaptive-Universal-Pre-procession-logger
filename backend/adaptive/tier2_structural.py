@@ -330,9 +330,9 @@ class StructuralAnalyzer:
                             evidence_type = EvidenceType.VALUE_TYPE_INFERENCE
                             field_type = "ip"
                         elif tok.value_type == ValueType.PORT:
-                            target = "destination.port"
-                            evidence_type = EvidenceType.VALUE_TYPE_INFERENCE
-                            field_type = "port"
+                            target = "message"
+                            evidence_type = EvidenceType.UNRESOLVED
+                            field_type = "string"
                         elif tok.value_type == ValueType.PROTOCOL:
                             target = "network.transport"
                             evidence_type = EvidenceType.VALUE_TYPE_INFERENCE

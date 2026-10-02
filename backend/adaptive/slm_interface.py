@@ -72,6 +72,59 @@ class SLMProvider(ABC):
     def get_mode_label(self) -> str:
         ...
 
+    def _build_prompt(self, log_line: str, templates: list[dict], hints: dict) -> str:
+        # Build structured context from Tier-2 hints
+        candidate_section = ""
+        candidates = hints.get("candidate_mappings", [])
+        if candidates:
+            candidate_section = "\nCandidate field mappings from structural analysis:"
+            for c in candidates:
+                candidate_section += (
+                    f"\n  {c.get('source_field', '?')}   {c.get('candidate_target', '?')} "
+                    f"(evidence: {c.get('evidence_type', '?')}, "
+                    f"value_type: {c.get('value_type', '?')}, "
+                    f"sample: {c.get('value_sample', '?')})"
+                )
+
+        unresolved = hints.get("unresolved_fields", [])
+        unresolved_section = f"\nFields needing semantic resolution: {unresolved}" if unresolved else ""
+
+        template_section = ""
+        for i, t in enumerate(templates[:3]):
+            tmpl_spec = t.get("spec", {})
+            template_section += f"\nHistorical Template {i+1} (similarity: {t.get('similarity', 0):.2f}):"
+            template_section += f"\n  Fields: {tmpl_spec.get('fields', {})}"
+
+        return rf"""You are a log field mapping resolver. Given structural analysis of a log line,
+resolve the semantic meaning of each source field to an OCSF target field.
+
+DO NOT generate any executable code. Return ONLY a JSON object.
+
+Log line: {log_line}
+{candidate_section}
+{unresolved_section}
+
+Similar historical templates: {template_section}
+
+Valid OCSF target fields: source.ip, destination.ip, source.port, destination.port, network.transport, action, message, time, severity, rule.uid, source.hostname
+
+CRITICAL RULES:
+1. ONLY map to 'source.ip' or 'destination.ip' if the field value is a valid IPv4 or IPv6 address.
+2. ONLY map to 'source.port' or 'destination.port' if the field value is a numeric port (0-65535).
+3. Fields like 'level=info' or 'level=debug' represent log level. Map them to 'severity'.
+4. General text fields map to 'message'.
+5. **UNSTRUCTURED TEXT:** If the log line contains natural language (e.g. "John tuesday logins from device 9788"), you MUST abstract the varying words (like names, days, IDs, hex codes, or entire messages) into regex capture groups.
+6. **REGEX ROBUSTNESS:** Do NOT generate overly strict regex (like `0x[0-9a-f]+` or `\\d+`) for arbitrary IDs, codes, or messages. The same position might contain spaces or different formats later (e.g. "0x14" today, "hello" or "I am hacker" tomorrow). ALWAYS use `(?P<var>.+?)` for these dynamic fields instead of `\\S+` or strict types. ONLY use strict regex for IPs or ports.
+7. You MUST provide a strict Python regex_pattern in your JSON response if you are parsing unstructured logs.
+
+Return a JSON object with this exact structure:
+{{
+  "mappings": [
+    {{"source_field": "<key_or_var>", "target_field": "<ocsf_target>", "confidence": <0.0-1.0>, "reason": "<explanation>"}}
+  ],
+  "regex_pattern": "^(?P<var_1>.+?)\\\\s+static_text\\\\s+(?P<var_2>.+?)$"
+}}"""
+
 
 class GroqProvider(SLMProvider):
     """
@@ -95,78 +148,118 @@ class GroqProvider(SLMProvider):
         if not settings.groq_api_key:
             raise RuntimeError("groq_api_key is not configured")
 
-        try:
-            async with httpx.AsyncClient(timeout=settings.ollama_timeout_seconds) as client:
-                response = await client.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {settings.groq_api_key}",
-                        "Content-Type": "application/json"
-                    },
-                    json={
-                        "model": settings.groq_model,
-                        "messages": [
-                            {"role": "system", "content": "You are a cybersecurity log parsing AI. You strictly return JSON."},
-                            {"role": "user", "content": prompt}
-                        ],
-                        "response_format": {"type": "json_object"},
-                        "temperature": 0.0
-                    }
-                )
-                response.raise_for_status()
-                result = response.json()
-                
-                content = result["choices"][0]["message"]["content"]
-                spec_data = json.loads(content)
-                mappings = spec_data.get("mappings", [])
-
-                fields = {}
-                field_types = {}
-                for m in mappings:
-                    src_field = m.get("source_field")
-                    target = m.get("target_field")
-                    if src_field and target:
-                        fields[src_field] = target
-                        field_types[src_field] = TARGET_TYPE_MAP.get(target, "string")
-
-                if not fields and structural_hints.get("fields"):
-                    fields = structural_hints["fields"]
-                    field_types = structural_hints.get("field_types", {})
-
-                regex_pattern = structural_hints.get("regex_pattern", "")
-                if regex_pattern:
-                    template = regex_pattern
+        import asyncio
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with httpx.AsyncClient(timeout=settings.ollama_timeout_seconds) as client:
+                    response = await client.post(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {settings.groq_api_key}",
+                            "Content-Type": "application/json"
+                        },
+                        json={
+                            "model": settings.groq_model,
+                            "messages": [
+                                {"role": "system", "content": "You are a cybersecurity log parsing AI. You strictly return JSON."},
+                                {"role": "user", "content": prompt}
+                            ],
+                            "response_format": {"type": "json_object"},
+                            "temperature": 0.0
+                        }
+                    )
+                    
+                    if response.status_code == 429 and attempt < max_retries - 1:
+                        logger.warning(f"Groq API rate limit hit. Retrying in {2 ** attempt * 5}s...")
+                        await asyncio.sleep(2 ** attempt * 5)
+                        continue
+                        
+                    response.raise_for_status()
+                    result = response.json()
+                    
+                    content = result["choices"][0]["message"]["content"]
+                    spec_data = json.loads(content)
+                    mappings = spec_data.get("mappings", [])
+                    break
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    if hasattr(e, "response") and e.response:
+                        logger.error(f"Groq API error text: {e.response.text}")
+                    logger.error(f"Groq API error: {e}")
+                    raise
                 else:
-                    template_parts = [f"{k}=<*>" for k in fields]
-                    template = " ".join(template_parts)
+                    logger.warning(f"Groq API error (attempt {attempt+1}/{max_retries}): {e}")
+                    await asyncio.sleep(2 ** attempt * 2)
 
-                overall_conf = (
-                    sum(m.get("confidence", 0.0) for m in mappings) / len(mappings)
-                ) if mappings else 0.0
+        fields = {}
+        field_types = {}
+        for m in mappings:
+            src_field = m.get("source_field")
+            target = m.get("target_field")
+            if src_field and target:
+                fields[src_field] = target
+                field_types[src_field] = TARGET_TYPE_MAP.get(target, "string")
 
-                spec = ParserSpecification(
-                    template=template,
-                    regex_pattern=regex_pattern,
-                    fields=fields,
-                    field_types=field_types,
-                    field_separator="=",
-                    entry_separator=" ",
-                    source_hint="groq_slm",
-                    confidence=overall_conf,
-                )
-                
-                tier_detail = {
-                    "provider": "Groq",
-                    "model": settings.groq_model,
-                    "mappings_generated": mappings,
-                    "prompt_length": len(prompt),
-                }
+        if not fields and structural_hints.get("fields"):
+            fields = structural_hints["fields"]
+            field_types = structural_hints.get("field_types", {})
 
-                return InferenceResult(spec=spec, tier_detail=tier_detail)
+        regex_pattern = spec_data.get("regex_pattern", structural_hints.get("regex_pattern", ""))
+        if regex_pattern:
+            template = regex_pattern
+            try:
+                import re
+                compiled = re.compile(regex_pattern)
+                group_names = {g.lower() for g in compiled.groupindex.keys()}
+                # Remove fields that the LLM mapped but didn't actually create a capture group for
+                fields = {k: v for k, v in fields.items() if k.lower() in group_names}
+            except Exception:
+                pass
+        else:
+            template_parts = [f"{k}=<*>" for k in fields]
+            template = " ".join(template_parts)
 
-        except Exception as e:
-            logger.error(f"Groq API error: {e}")
-            raise
+        overall_conf = (
+            sum(m.get("confidence", 0.0) for m in mappings) / len(mappings)
+        ) if mappings else 0.0
+
+        spec = ParserSpecification(
+            template=template,
+            regex_pattern=regex_pattern,
+            fields=fields,
+            field_types=field_types,
+            field_separator="=",
+            entry_separator=" ",
+            source_hint="groq_slm",
+            confidence=overall_conf,
+        )
+        
+        # Convert raw mappings to FieldResolution objects
+        resolved = []
+        for m in mappings:
+            src = m.get("source_field", "")
+            tgt = m.get("target_field", "")
+            conf = min(float(m.get("confidence", 0.5)), 0.95)
+            reason = m.get("reason", "SLM inference")
+            if src and tgt:
+                resolved.append(FieldResolution(
+                    source_field=src,
+                    target_field=tgt,
+                    confidence=conf,
+                    reason=reason
+                ))
+
+        return InferenceResult(
+            spec=spec,
+            confidence=overall_conf,
+            mode=InferenceMode.CLOUD_LLM,
+            detail=f"Groq Cloud LLM resolved semantic field mappings using {settings.groq_model}",
+            resolved_mappings=resolved,
+            retrieved_templates_used=len(historical_templates)
+        )
+
+
 
 class OllamaProvider(SLMProvider):
     """
@@ -268,7 +361,7 @@ class OllamaProvider(SLMProvider):
                     fields = spec_data["fields"]
                     field_types = spec_data.get("field_types", {})
 
-                regex_pattern = structural_hints.get("regex_pattern", "")
+                regex_pattern = spec_data.get("regex_pattern", structural_hints.get("regex_pattern", ""))
                 if regex_pattern:
                     template = regex_pattern
                 else:
@@ -302,56 +395,6 @@ class OllamaProvider(SLMProvider):
         except Exception as e:
             logger.warning(f"Ollama inference failed: {e}. Cannot generate spec.")
             raise
-
-    def _build_prompt(self, log_line: str, templates: list[dict], hints: dict) -> str:
-        # Build structured context from Tier-2 hints
-        candidate_section = ""
-        candidates = hints.get("candidate_mappings", [])
-        if candidates:
-            candidate_section = "\nCandidate field mappings from structural analysis:"
-            for c in candidates:
-                candidate_section += (
-                    f"\n  {c.get('source_field', '?')} → {c.get('candidate_target', '?')} "
-                    f"(evidence: {c.get('evidence_type', '?')}, "
-                    f"value_type: {c.get('value_type', '?')}, "
-                    f"sample: {c.get('value_sample', '?')})"
-                )
-
-        unresolved = hints.get("unresolved_fields", [])
-        unresolved_section = f"\nFields needing semantic resolution: {unresolved}" if unresolved else ""
-
-        template_section = ""
-        for i, t in enumerate(templates[:3]):
-            tmpl_spec = t.get("spec", {})
-            template_section += f"\nHistorical Template {i+1} (similarity: {t.get('similarity', 0):.2f}):"
-            template_section += f"\n  Fields: {tmpl_spec.get('fields', {})}"
-
-        return f"""You are a log field mapping resolver. Given structural analysis of a log line,
-resolve the semantic meaning of each source field to an OCSF target field.
-
-DO NOT generate any executable code. Return ONLY a JSON object.
-
-Log line: {log_line}
-{candidate_section}
-{unresolved_section}
-
-Similar historical templates: {template_section}
-
-Valid OCSF target fields: source.ip, destination.ip, source.port, destination.port, network.transport, action, message, time, severity, rule.uid, source.hostname
-
-CRITICAL RULES:
-1. ONLY map to 'source.ip' or 'destination.ip' if the field value is a valid IPv4 or IPv6 address.
-2. ONLY map to 'source.port' or 'destination.port' if the field value is a numeric port (0-65535).
-3. Fields like 'level=info' or 'level=debug' represent log level. Map them to 'severity'.
-4. General text fields map to 'message'.
-
-Return a JSON object with this exact structure:
-{{
-  "mappings": [
-    {{"source_field": "<key_or_var>", "target_field": "<ocsf_target>", "confidence": <0.0-1.0>, "reason": "<explanation>"}}
-  ]
-}}"""
-
 
 class DemoFallbackProvider(SLMProvider):
     """

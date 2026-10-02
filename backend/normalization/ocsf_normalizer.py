@@ -72,7 +72,7 @@ class OCSFNormalizer:
         severity = self.SEVERITY_MAP.get(severity_id, "Unknown")
 
         # Message from parsed fields
-        message = parsed_fields.get("message", "")
+        message = str(parsed_fields.get("message", ""))
 
         # Build src/dst endpoint dicts
         src_endpoint: dict[str, Any] = {}
@@ -129,6 +129,7 @@ class OCSFNormalizer:
             connection_info=connection_info,
             metadata=metadata,
             message=message,
+            unmapped=parsed_fields,
             raw_event_id=raw_event.event_id,
             raw_sha256=raw_event.raw_sha256,
             parser_id=parser_id,

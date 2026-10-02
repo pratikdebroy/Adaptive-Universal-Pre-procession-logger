@@ -271,6 +271,9 @@ class OCSFEvent(BaseModel):
     # Message
     message: str = ""
 
+    # Unmapped fields
+    unmapped: dict[str, Any] = Field(default_factory=dict)
+
     # Provenance (custom extension)
     raw_event_id: str = ""
     raw_sha256: str = ""

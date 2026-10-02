@@ -49,6 +49,13 @@ class Settings(BaseSettings):
         "reject", "permit", "accept", "reset",
         "Allowed", "Denied", "Dropped", "Blocked",
         "LOGIN", "LOGOUT", "SUCCESS", "FAILURE", "login", "logout", "success", "failed",
+        "logins", "logouts",
+        # Router/switch interface state changes
+        "up", "down", "UP", "DOWN", "UPDOWN", "CHANGED",
+        "administratively down", "connected", "disconnected",
+        # HTTP methods (web server / API gateway logs)
+        "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS",
+        "get", "post", "put", "delete", "patch", "head", "options",
     ]
 
     # --- Ollama / Inference ---
@@ -58,7 +65,7 @@ class Settings(BaseSettings):
     
     # --- Groq / Cloud Inference ---
     groq_api_key: str = ""
-    groq_model: str = "llama3-8b-8192"
+    groq_model: str = "qwen/qwen3.8-27b"
     
     inference_mode: str = "auto"  # "auto", "groq", "ollama", "demo_fallback"
 

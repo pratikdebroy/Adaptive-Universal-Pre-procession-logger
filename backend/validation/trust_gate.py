@@ -357,9 +357,33 @@ class HybridTrustGate:
                             parsed_ts = dt.timestamp()
                         except ValueError:
                             if re.match(r"^\d{2}:\d{2}:\d{2}(\.\d+)?$", val_str):
+                                # Time-only format (HH:MM:SS) — assume today
                                 parsed_ts = datetime.datetime.now(datetime.timezone.utc).timestamp()
                             else:
-                                raise
+                                # Fallback: try common non-ISO formats
+                                # GIN: 2026/09/19 - 09:03:20, Apache: 19/Sep/2026:09:03:20
+                                # Syslog: Sep 19 09:03:20, nginx: 2026/09/19 09:03:20
+                                fallback_formats = [
+                                    "%Y/%m/%d - %H:%M:%S",   # GIN framework
+                                    "%Y/%m/%d %H:%M:%S",     # nginx-style
+                                    "%d/%b/%Y:%H:%M:%S",     # Apache CLF
+                                    "%b %d %H:%M:%S",        # Syslog (no year)
+                                    "%Y-%m-%d %H:%M:%S",     # MySQL/Postgres
+                                    "%d-%m-%Y %H:%M:%S",     # European
+                                    "%m/%d/%Y %H:%M:%S",     # US date
+                                    "%Y%m%d%H%M%S",          # Compact
+                                ]
+                                for fmt in fallback_formats:
+                                    try:
+                                        dt = datetime.datetime.strptime(val_str.strip(), fmt)
+                                        if dt.year == 1900:
+                                            dt = dt.replace(year=datetime.datetime.now().year)
+                                        parsed_ts = dt.replace(tzinfo=datetime.timezone.utc).timestamp()
+                                        break
+                                    except ValueError:
+                                        continue
+                                if parsed_ts is None:
+                                    raise
                 except Exception:
                     parsed_ts = None
 

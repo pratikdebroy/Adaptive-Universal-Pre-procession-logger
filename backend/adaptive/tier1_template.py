@@ -14,18 +14,46 @@ from backend.config import settings
 
 
 class LogCluster:
-    """A cluster of log lines sharing the same template pattern."""
+    """A cluster of log lines sharing the same template pattern.
+    
+    Supports multiple parser variants per template (diagram step 3A).
+    Each variant is a parser_id that can parse logs matching this template.
+    """
 
-    def __init__(self, tokens: list[str], cluster_id: int):
+    def __init__(self, tokens: list[str], cluster_id: int, parser_id: str = ""):
         self.template = list(tokens)
         self.cluster_id = cluster_id
         self.size = 1
+        self._parser_ids: list[str] = [parser_id] if parser_id else []
+
+    @property
+    def parser_id(self) -> str:
+        """Backwards-compatible: returns first variant or empty string."""
+        return self._parser_ids[0] if self._parser_ids else ""
+
+    @parser_id.setter
+    def parser_id(self, value: str):
+        if value:
+            if value not in self._parser_ids:
+                self._parser_ids.insert(0, value)
+        
+    def get_variant_ids(self) -> list[str]:
+        """Return all parser variant IDs for this template cluster."""
+        return list(self._parser_ids)
+
+    def add_variant(self, parser_id: str):
+        """Add a new parser variant to this cluster (self-healing / drift correction)."""
+        if parser_id and parser_id not in self._parser_ids:
+            self._parser_ids.append(parser_id)
+
+    def has_variants(self) -> bool:
+        return len(self._parser_ids) > 0
 
     def get_template_str(self) -> str:
         return " ".join(self.template)
 
     def __repr__(self):
-        return f"<Cluster #{self.cluster_id} (size={self.size}): {self.get_template_str()}>"
+        return f"<Cluster #{self.cluster_id} (size={self.size}, variants={len(self._parser_ids)}): {self.get_template_str()}>"
 
 
 class DrainNode:
@@ -65,7 +93,11 @@ class DrainMiner:
         return bool(re.search(r"\d", token))
 
     def _tree_search(self, tokens: list[str]) -> list[LogCluster]:
-        """Traverse tree to find candidate clusters."""
+        """Traverse tree to find candidate clusters.
+        
+        Handles KV tokens (KEY=VALUE) by using the key prefix for navigation,
+        since the value part may contain digits that would otherwise route to '*'.
+        """
         curr = self.root
         length = len(tokens)
 
@@ -79,13 +111,21 @@ class DrainMiner:
             if i >= length:
                 break
             token = tokens[i]
-            if self._has_digits(token):
+            
+            # For KV tokens like "SRC=10.10.1.25", try the key prefix "SRC=<*>" first
+            kv_key = None
+            if "=" in token and not token.startswith("="):
+                kv_key = token.split("=", 1)[0] + "=<*>"
+            
+            if kv_key and kv_key in curr.children:
+                curr = curr.children[kv_key]
+            elif token in curr.children:
+                curr = curr.children[token]
+            elif self._has_digits(token):
                 if "*" in curr.children:
                     curr = curr.children["*"]
                 else:
                     return []
-            elif token in curr.children:
-                curr = curr.children[token]
             elif "*" in curr.children:
                 curr = curr.children["*"]
             else:
@@ -93,10 +133,37 @@ class DrainMiner:
 
         return curr.clusters
 
+    @staticmethod
+    def _token_matches_wildcard(template_tok: str, message_tok: str) -> bool:
+        """Check if a template token with embedded <*> wildcards matches a message token.
+        
+        Examples:
+          '%LINK-<*>-<*>:' matches '%LINK-3-UPDOWN:'
+          'SRC=<*>' matches 'SRC=10.10.1.25'
+          '{<*>}' matches '{TCP}'
+          '<*>,'' matches 'GigabitEthernet0/1,'
+        """
+        if "<*>" not in template_tok:
+            return template_tok == message_tok
+        # Build a regex from the template token: escape everything except <*>
+        import re as _re
+        parts = template_tok.split("<*>")
+        pattern = ".*".join(_re.escape(p) for p in parts)
+        pattern = "^" + pattern + "$"
+        try:
+            return bool(_re.match(pattern, message_tok))
+        except _re.error:
+            return False
+
     def _similarity(self, template: list[str], tokens: list[str]) -> tuple[float, int]:
         """
         Drain similarity: count of matching non-wildcard tokens / total tokens.
-        Wildcard <*> does NOT count as a match.
+        
+        Handles four cases:
+        1. Pure wildcard '<*>' → skip (doesn't count as match or non-match)
+        2. KV wildcard 'KEY=<*>' vs 'KEY=value' → counts as match (key prefix matches)
+        3. Embedded wildcard '%LINK-<*>-<*>:' vs '%LINK-3-UPDOWN:' → regex match
+        4. Exact token match → counts as match
         """
         if len(template) != len(tokens):
             return 0.0, 0
@@ -108,6 +175,10 @@ class DrainMiner:
             non_wildcard += 1
             if t == s:
                 sim_count += 1
+            elif "<*>" in t:
+                # Token contains embedded wildcards
+                if self._token_matches_wildcard(t, s):
+                    sim_count += 1
         total = len(tokens)
         return (sim_count / total if total > 0 else 0.0), non_wildcard
 
@@ -150,6 +221,18 @@ class DrainMiner:
             self.clusters.append(cluster)
             self._insert(tokens, cluster)
             return cluster, True
+
+    def add_explicit_template(self, template_str: str, parser_id: str = "") -> "LogCluster | None":
+        """Force inject an exact template string (with wildcards) and map to a parser_id.
+        Returns the created LogCluster so the caller can attach additional variants."""
+        tokens = template_str.strip().split()
+        if not tokens:
+            return None
+        cluster = LogCluster(tokens, self._next_id, parser_id)
+        self._next_id += 1
+        self.clusters.append(cluster)
+        self._insert(tokens, cluster)
+        return cluster
 
     def _insert(self, tokens: list[str], cluster: LogCluster):
         """Insert cluster into parse tree."""
@@ -256,19 +339,8 @@ class Tier1Matcher:
             sim_th=settings.drain_sim_threshold,
             max_children=settings.drain_max_children,
         )
-        self._seed_known_templates()
-
-    def _seed_known_templates(self):
-        """Pre-load known log formats into the miner."""
-        known_logs = [
-            "SRC=10.10.1.25 DST=172.16.2.10 PROTO=TCP DPT=443 ACTION=ALLOW",
-            "SRC=192.168.1.100 DST=10.0.0.1 PROTO=UDP DPT=53 ACTION=ALLOW",
-            "%LINK-3-UPDOWN: Interface GigabitEthernet0/1, changed state to down",
-            "%LINK-5-CHANGED: Interface Serial0/0, changed state to administratively down",
-            '[**] [1:2001:3] ET SCAN Potential SSH Scan [**] {TCP} 192.168.1.100:45123 -> 10.0.0.1:22',
-        ]
-        for log in known_logs:
-            self.miner.add_log_message(log)
+        # Known templates are seeded by pipeline.initialize() via add_explicit_template()
+        # with parser IDs attached as variants — no need to seed concrete examples here.
 
     @staticmethod
     def _token_matches(msg_tok: str, tmpl_tok: str) -> bool:
@@ -322,9 +394,59 @@ class Tier1Matcher:
 
         return front_sim, back_sim, overall_sim, drift_tokens
 
-    def add_template(self, message: str) -> None:
-        """Add a new log message to the BDPT miner dynamically."""
-        self.miner.add_log_message(message)
+    def add_template(self, message: str) -> "LogCluster | None":
+        """Add a new log message to the BDPT miner. Returns the cluster that was created or matched."""
+        cluster, _ = self.miner.add_log_message(message)
+        return cluster
+
+    def match_with_cluster(self, message: str) -> "tuple[bool, float, LogCluster | None, dict]":
+        """
+        Extended match that returns the matched LogCluster object alongside confidence.
+        Used by the pipeline so it can directly access variant IDs from the leaf node.
+        
+        Strategy:
+          1. Direct tree match via DrainMiner.match() — O(depth), handles same-length templates
+          2. If no variant-bearing cluster found, bidirectional scan against all variant-bearing
+             clusters — handles Router/IDS where template token count ≠ log token count
+        
+        Returns: (confident, score, best_cluster, detail)
+        """
+        confident, score, detail = self.match(message)
+        # 1. Direct tree match (fast, O(depth))
+        best_cluster, best_sim = self.miner.match(message)
+
+        # If tree found a cluster with variants, use it
+        if best_cluster and best_cluster.has_variants():
+            return confident, score, best_cluster, detail
+
+        # 2. Fallback: bidirectional scan across all variant-bearing clusters
+        #    This handles formats like Router/IDS where template token count differs
+        #    from actual log token count (e.g., IDS template has 8 tokens but log has 12)
+        tokens = DrainMiner.preprocess(message)
+        fallback_cluster = None
+        fallback_score = -1.0
+
+        for cluster in self.miner.clusters:
+            if not cluster.has_variants():
+                continue
+
+            # Try standard similarity first (works when token counts match)
+            sim, _ = self.miner._similarity(cluster.template, tokens)
+            if sim > fallback_score:
+                fallback_score = sim
+                fallback_cluster = cluster
+
+            # If token counts differ, try bidirectional scan
+            if len(cluster.template) != len(tokens):
+                _, _, overall_sim, _ = self._bidirectional_scan(tokens, cluster.template)
+                if overall_sim > fallback_score:
+                    fallback_score = overall_sim
+                    fallback_cluster = cluster
+
+        if fallback_cluster and fallback_score > 0.0:
+            return confident, score, fallback_cluster, detail
+
+        return confident, score, None, detail
 
     def match(self, message: str) -> tuple[bool, float, dict[str, Any]]:
         """

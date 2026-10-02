@@ -175,6 +175,46 @@ def check_transport_and_framing(raw_message: str, source: str = "unknown") -> In
             metadata={"source": source, "length": len(raw_message)},
         )
 
+    # 1b. Minimum meaningful length check (single char / trivially short input)
+    stripped = raw_message.strip()
+    if len(stripped) < 3:
+        return IngestionSafetyResult(
+            safe=False,
+            detected_format="text",
+            reason=QuarantineReason.MALFORMED_INPUT,
+            failed_check="transport.too_short",
+            severity=QuarantineSeverity.LOW,
+            detail=f"Event too short to be a valid log entry ({len(stripped)} chars)",
+            metadata={"source": source, "length": len(stripped)},
+        )
+
+    # 1c. Code injection / SQL injection detection in raw input
+    # This catches payloads that are NOT legitimate logs but attack strings
+    _INJECTION_PATTERNS = [
+        (r"(?:^|['\";])\s*DROP\s+TABLE\b", "SQL_DROP_TABLE"),
+        (r"(?:^|['\";])\s*DELETE\s+FROM\b", "SQL_DELETE"),
+        (r"(?:^|['\";])\s*INSERT\s+INTO\b", "SQL_INSERT"),
+        (r"(?:^|['\";])\s*UPDATE\s+\w+\s+SET\b", "SQL_UPDATE"),
+        (r"(?:^|['\";])\s*UNION\s+SELECT\b", "SQL_UNION"),
+        (r"__import__\s*\(", "PYTHON_IMPORT"),
+        (r"(?:^|\s)eval\s*\(", "CODE_EVAL"),
+        (r"(?:^|\s)exec\s*\(", "CODE_EXEC"),
+        (r"os\.system\s*\(", "OS_COMMAND"),
+        (r"subprocess\.\w+\s*\(", "SUBPROCESS"),
+    ]
+    msg_to_check = raw_message
+    for pattern, threat_type in _INJECTION_PATTERNS:
+        if re.search(pattern, msg_to_check, re.IGNORECASE):
+            return IngestionSafetyResult(
+                safe=False,
+                detected_format="text",
+                reason=QuarantineReason.MALFORMED_INPUT,
+                failed_check=f"security.injection:{threat_type}",
+                severity=QuarantineSeverity.CRITICAL,
+                detail=f"Potential injection payload detected ({threat_type})",
+                metadata={"source": source, "threat": threat_type},
+            )
+
     # 2. Encoding / Binary check
     # Check for unprintable binary control characters (except common whitespace \t, \n, \r)
     # or binary garbage like \x00, \xff\xfe
